@@ -172,6 +172,42 @@ export async function buildContractCallTx(
 }
 
 /**
+ * Build a contract-call transaction with multiple invokeHostFunction operations
+ * (one per set of arguments). Used for batch operations where several contract
+ * calls are assembled into a single Soroban transaction.
+ */
+export async function buildBatchContractCallTx(
+  rpcUrl:      string,
+  passphrase:  string,
+  caller:      string,
+  contractId:  string,
+  method:      string,
+  argsArray:   xdr.ScVal[][],
+): Promise<ReturnType<TransactionBuilder['build']>> {
+  const server  = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+
+  let account;
+  try {
+    account = await server.getAccount(caller);
+  } catch (err) {
+    throw RateLimitError.fromRpcError(err) ?? err;
+  }
+
+  const contract = new Contract(contractId);
+
+  const builder = new TransactionBuilder(account, {
+    fee:            BASE_FEE,
+    networkPassphrase: passphrase,
+  });
+
+  for (const args of argsArray) {
+    builder.addOperation(contract.call(method, ...args));
+  }
+
+  return builder.setTimeout(30).build();
+}
+
+/**
  * Simulate a transaction, then assemble + sign + submit.
  * Returns the transaction hash on success.
  */
