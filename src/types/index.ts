@@ -159,6 +159,16 @@ export interface BatchWithdrawResult {
   error?: string;
 }
 
+export interface BatchCreateStreamResult {
+  /** Index into the configs array passed to createBatchStreams(). */
+  index: number;
+  success: boolean;
+  streamId?: bigint;
+  streamAddress?: string;
+  txHash?: string;
+  error?: string;
+}
+
 // -- Fee estimation ----------------------------------------------------------
 
 export type StreamOperation =
