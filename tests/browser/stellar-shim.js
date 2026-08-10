@@ -68,6 +68,19 @@ class TransactionBuilder {
 
 const BASE_FEE = '100';
 
+class Asset {
+  constructor(code, issuer) {
+    this.code = code;
+    this.issuer = issuer;
+  }
+  static native() {
+    return new Asset('XLM');
+  }
+  contractId(_networkPassphrase) {
+    return 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+  }
+}
+
 class Transaction {
   constructor(xdr, passphrase) {
     this.xdr = xdr;
@@ -82,6 +95,7 @@ export {
   Keypair,
   Account,
   Address,
+  Asset,
   SorobanRpc,
   nativeToScVal,
   boolToScVal,

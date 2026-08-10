@@ -24,6 +24,9 @@ export {
   FactoryErrorCode,
   GovernorErrorCode,
   UnsupportedChainError,
+  StreamFiNetworkError,
+  InsufficientBalanceError,
+  RateLimitError,
   SUPPORTED_NETWORKS,
   UNKNOWN_CONTRACT_ERROR_CODE,
 } from './errors.js';
@@ -64,3 +67,19 @@ export type {
   StreamDiff,
   Module36Metrics,
 } from './module36.js';
+
+export { Module26 } from './module26.js';
+export type {
+  Module26Config,
+  PortfolioStreamItem,
+  PortfolioSummary,
+  Module26Metrics,
+} from './module26.js';
+
+export { Module48 } from './module48.js';
+export type {
+  Module48Config,
+  StreamBatchItem,
+  Module48Result,
+  Module48Metrics,
+} from './module48.js';

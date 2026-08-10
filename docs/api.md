@@ -19,6 +19,13 @@ new ConduitClient(config: ConduitConfig)
 | `rpcUrl` | `string` | | Network default |
 | `factoryAddress` | `string` | | Deployed factory |
 | `governorAddress` | `string` | | Deployed governor |
+| `wallet` | `WalletAdapter` | | — |
+
+### Convenience methods
+
+* `pauseStream(streamId: string) → Promise<string>` — equivalent to `client.streams.pause(streamId)`.
+* `unpauseStream(streamId: string) → Promise<string>` — equivalent to `client.streams.resume(streamId)`.
+* `setWallet(wallet: WalletAdapter): void` — dynamically attach or change the active wallet adapter. Throws `UnsupportedChainError` if the wallet's `chainId` is on a different network than the client was configured for. See [Wallet Adapters](#wallet-adapters) below. Only propagates to `client.streams` — `client.factory` and `client.governor` are read-only and use `config.keypair` for simulation fee sourcing, so they are unaffected.
 
 ---
 
@@ -154,6 +161,13 @@ sub.unsubscribe();
 
 ### `streamCount() → Promise<bigint>`
 ### `streamAddress(id) → Promise<string | null>`
+
+Resolved (non-null) addresses are cached in-memory for the lifetime of the client, since a
+stream's contract address is fixed at creation and never changes. A `null` result (stream not
+yet found) is not cached, so a later call for the same `id` will still hit the network. This
+cache is what `StreamsModule` relies on to avoid re-resolving the same address on every
+`get`/`withdraw`/`cancel`/`pause`/`resume`/`topUp`/`clawback` call and when paginating `list()`.
+
 ### `protocolFeeBps() → Promise<number>`
 
 ---
@@ -361,6 +375,100 @@ retries against the network.
 import { getTokenDecimals, clearTokenDecimalsCache } from '@conduit-protocol/sdk';
 
 clearTokenDecimalsCache(); // force a fresh simulation on the next call
+```
+
+---
+
+## Wallet Adapters
+
+`WalletAdapter` is the interface `client.streams` signs transactions through — implement it to
+support any wallet. The SDK ships two implementations:
+
+### `KeypairWalletAdapter`
+
+Wraps a raw `@stellar/stellar-sdk` `Keypair` so `config.keypair` can be used through the same
+`WalletAdapter` interface as a browser or WalletConnect wallet. Constructed automatically by
+`ConduitClient`/`StreamsModule` when `config.keypair` is supplied and no `config.wallet` is given.
+
+```typescript
+new KeypairWalletAdapter(keypair: Keypair)
+```
+
+* `getPublicKey(): string` — the keypair's G-address.
+* `signTransaction(tx: Transaction | string, opts?: SignTransactionOptions): Promise<Transaction | string>` — signs and returns a `Transaction` instance as-is; for a raw XDR string, requires `opts.networkPassphrase` (throws otherwise) and returns signed XDR. `opts.accountToSign` is not applicable — a keypair only ever signs as itself.
+* `isConnected(): boolean` — always `true`.
+
+### `WalletConnectAdapter`
+
+Wraps a WalletConnect v2 session. See its JSDoc in `src/adapters/walletconnect.ts` for the full
+option set.
+
+---
+
+## `GraphQLIndexer`
+
+A client for a Conduit indexer's GraphQL endpoint — one-shot queries plus live subscriptions.
+
+```typescript
+new GraphQLIndexer(endpoint: string)
+```
+
+Throws if `endpoint` is empty.
+
+### `query(options) → Promise<unknown>`
+
+Issues a single GraphQL query as an HTTP POST and returns the parsed JSON response.
+
+| Field | Type | Required |
+|-------|------|----------|
+| `query` | `string` | ✓ |
+| `variables` | `Record<string, unknown>` | |
+| `headers` | `Record<string, string>` | |
+
+**Throws** if `query` is empty, or if the HTTP response is not `ok`.
+
+### `subscribe(options) → IndexerSubscription`
+
+Opens a live subscription. Prefers a `graphql-transport-ws` WebSocket connection derived from
+`endpoint` (`https://` → `wss://`, `http://` → `ws://`); when no `WebSocket` constructor is
+available (e.g. some non-browser, non-Node runtimes) it falls back to reading a
+`text/event-stream` HTTP response and parsing its `data:` lines.
+
+| Field | Type | Required |
+|-------|------|----------|
+| `query` | `string` | ✓ |
+| `variables` | `Record<string, unknown>` | |
+| `headers` | `Record<string, string>` | |
+| `onData` | `(data: unknown) => void` | ✓ |
+| `onError` | `(error: Error) => void` | |
+
+Returns `{ unsubscribe(): void }`. Calling `unsubscribe()` is idempotent — it sends a
+`complete` message (WebSocket transport) or aborts the underlying fetch (SSE fallback) and is
+safe to call more than once.
+
+### `getSubscriptionCount() → number`
+
+Number of subscriptions currently active on this indexer instance.
+
+### `cleanup(): void`
+
+Unsubscribes every active subscription and marks the indexer destroyed — subsequent calls to
+`query()` or `subscribe()` throw.
+
+```typescript
+import { GraphQLIndexer } from '@conduit-protocol/sdk';
+
+const indexer = new GraphQLIndexer('https://indexer.streamfi.io/graphql');
+
+const sub = indexer.subscribe({
+  query: 'subscription { streamUpdated(id: "1") { id withdrawn } }',
+  onData: (data) => console.log(data),
+  onError: (err) => console.error(err),
+});
+
+// later
+sub.unsubscribe();
+indexer.cleanup();
 ```
 
 ---
@@ -598,4 +706,55 @@ new Module36(config?: Module36Config)
 * `computeAccrual(ratePerSecond: bigint, fromSec: number, toSec: number): bigint` — Fast BigInt accrual between timestamps.
 * `clearCache(): void` — Clears the LRU cache and performance counters.
 * `getPerformanceMetrics(): Module36Metrics` — Returns `totalDiffs`, `cacheHits`, `cacheMisses`, `averageExecutionTimeMs`, and `measuredSpeedupPercent` (a real measurement derived from this instance's own accumulated hit/miss timings, `null` until both have occurred at least once — not a fixed assumed percentage).
+
+---
+
+## `Module26` (Feature #26)
+
+Stream portfolio aggregator implementing Feature #26. Uses LRU-memoized summaries to avoid recomputing totals for repeated identical portfolio comparisons; actual speedup is workload-dependent (proportional to cache hit rate).
+
+### Constructor
+
+```typescript
+new Module26(config?: Module26Config)
+```
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `cacheSize` | `number` | `1000` | Max entries in the LRU memoization cache |
+| `enableOptimization` | `boolean` | `true` | Enables LRU-memoized aggregation |
+| `batchChunkSize` | `number` | `50` | Chunk size for large portfolio scans |
+
+### Methods
+
+* `aggregatePortfolio(items: PortfolioStreamItem[], nowSec?: number): PortfolioSummary` — Totals withdrawable balance, active rate, and lifecycle counts.
+* `projectRemaining(stream: StreamInfo, horizonSecs: number, nowSec?: number): bigint` — Projects remaining accrual over a time horizon.
+* `clearCache(): void` — Clears the LRU cache and performance counters.
+* `getPerformanceMetrics(): Module26Metrics` — Returns `totalAggregations`, `cacheHits`, `cacheMisses`, `averageExecutionTimeMs`, and `measuredSpeedupPercent` (a real measurement derived from this instance's own accumulated hit/miss timings, `null` until both have occurred at least once — not a fixed assumed percentage).
+
+---
+
+## `Module48` (Feature #48)
+
+Streaming analytics and batch-evaluation engine implementing Feature #48. Uses a memoized lookup cache to avoid recomputing withdrawable/progress for repeated identical stream evaluations; actual speedup is workload-dependent (proportional to cache hit rate).
+
+### Constructor
+
+```typescript
+new Module48(config?: Module48Config)
+```
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `cacheSize` | `number` | `1000` | Max entries in memoization cache |
+| `enableOptimization` | `boolean` | `true` | Enables memoized lookup caching |
+| `batchChunkSize` | `number` | `50` | Stream chunk size for batch processing |
+
+### Methods
+
+* `processSingleItem(item: StreamBatchItem): Module48Result` - Evaluates a stream's withdrawable balance and progress.
+* `processStreamBatch(items: StreamBatchItem[]): Module48Result[]` - Processes batch array of streams in chunks.
+* `computeOptimizedYield(ratePerSecond: bigint, durationSecs: number): bigint` - Fast BigInt yield calculation.
+* `clearCache(): void` - Clears the internal lookup cache and metrics.
+* `getPerformanceMetrics(): Module48Metrics` - Returns `totalProcessed`, `cacheHits`, `cacheMisses`, `averageExecutionTimeMs`, and `measuredSpeedupPercent` (a real measurement derived from this instance's own accumulated hit/miss timings, `null` until both have occurred at least once — not a fixed assumed percentage).
 
