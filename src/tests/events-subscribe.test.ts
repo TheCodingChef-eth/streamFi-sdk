@@ -419,10 +419,6 @@ describe('subscribeToStream', () => {
     expect(mockGetEvents).toHaveBeenCalledTimes(3);
 
     sub.unsubscribe();
-    warn.mockRestore();
-  });
-});
-
   it('replays missed events by sequence on reconnect (#623)', async () => {
     const { Address, Keypair, nativeToScVal } = await import('@stellar/stellar-sdk');
     const sender = Keypair.random().publicKey();
@@ -458,3 +454,7 @@ describe('subscribeToStream', () => {
 
     sub.unsubscribe();
   });
+    warn.mockRestore();
+  });
+});
+
