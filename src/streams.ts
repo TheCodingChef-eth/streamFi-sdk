@@ -84,15 +84,6 @@ export class StreamsModule {
   private activeWallet?:       WalletAdapter;
 
   /**
-   * Session-scoped cache of stream ID → contract address resolutions.
-   * Avoids a redundant factory RPC on every get/withdraw/cancel/pause/resume/topUp/clawback call
-   * for the same stream within a single StreamsModule lifetime. The cache is
-   * intentionally not invalidated on writes — a stream's contract address is
-   * immutable once assigned by the factory.
-   */
-  private readonly _addrCache = new Map<bigint, string>();
-
-  /**
    * Cached rate-limit-retry proxy for this module's RPC URL.
    * createRpcServer() wraps the underlying cached Server in a new Proxy on
    * every call, so we hold one proxy per StreamsModule instance to avoid the
@@ -657,6 +648,11 @@ export class StreamsModule {
     return subscribeToStream(this.rpcUrl, address, handlers);
   }
 
+  /** Clear the address cache. Useful for testing or manual memory management. */
+  clearAddressCache(): void {
+    this._factory.clearAddressCache();
+  }
+
   /** Synchronous subscribe - resolves address lazily on first poll tick. */
   subscribe(streamId: bigint | string, handlers: StreamEventHandlers): Subscription {
     let inner: Subscription | null = null;
@@ -746,15 +742,11 @@ export class StreamsModule {
   }
 
   private async _resolveAddr(id: bigint): Promise<string> {
-    // Return from the session cache to avoid a factory RPC on every operation
-    // for the same stream ID. Stream contract addresses are immutable once
-    // assigned by the factory, so the cache never needs invalidation.
-    const cached = this._addrCache.get(id);
-    if (cached) return cached;
-
+    // Use the factory's bounded LRU cache for address resolution.
+    // Stream contract addresses are immutable once assigned by the factory,
+    // so the cache never needs invalidation.
     const addr = await this._factory.streamAddress(id);
     if (!addr) throw new ConduitError('stream', StreamErrorCode.StreamNotFound, `Stream ${id} not found`);
-    this._addrCache.set(id, addr);
     return addr;
   }
 

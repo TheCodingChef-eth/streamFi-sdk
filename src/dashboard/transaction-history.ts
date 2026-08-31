@@ -258,20 +258,28 @@ export function normalizeTransaction(raw: unknown): TransactionRecord | null {
 
   const record = raw as Record<string, unknown>;
 
-  const id = asString(record['id'] ?? record['hash'] ?? record['streamId']);
+  const id = asString(record['id'] ?? record['hash']);
   const hash = asString(record['hash'] ?? record['txHash'] ?? record['id']);
+  const streamId = asString(record['streamId'] ?? record['stream_id']);
 
   // A record with no identity at all is unusable — drop it rather than
   // rendering a row with an empty React key.
-  if (id === '' && hash === '') return null;
+  if (id === '' && hash === '' && streamId === '') return null;
 
   const amountRaw = record['amount'] ?? record['value'] ?? record['ratePerSecond'];
+  const kind = asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN');
+  const timestamp = asTimestamp(record['timestamp'] ?? record['createdAt']);
+
+  // When neither id nor hash is present, synthesise a composite key so distinct
+  // events on the same stream aren't treated as duplicates.
+  const synthesizedId =
+    id !== '' ? id : hash !== '' ? hash : `${streamId}:${kind}:${timestamp}`;
 
   return {
-    id: id === '' ? hash : id,
+    id: synthesizedId,
     hash,
-    streamId: asString(record['streamId'] ?? record['stream_id']),
-    kind: asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN'),
+    streamId,
+    kind,
     direction: asEnum(record['direction'], VALID_DIRECTIONS, 'UNKNOWN'),
     status: asEnum(record['status'], VALID_STATUSES, 'UNKNOWN'),
     amount: asString(amountRaw, '0'),
@@ -279,7 +287,7 @@ export function normalizeTransaction(raw: unknown): TransactionRecord | null {
     counterparty: asString(
       record['counterparty'] ?? record['recipient'] ?? record['sender'],
     ),
-    timestamp: asTimestamp(record['timestamp'] ?? record['createdAt']),
+    timestamp,
   };
 }
 

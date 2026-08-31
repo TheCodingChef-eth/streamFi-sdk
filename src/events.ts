@@ -91,7 +91,6 @@ export function subscribeToStream(
   let   consecutiveFailures    = 0;
   let   stopped                = false;
   let   timer: ReturnType<typeof setTimeout> | undefined;
-  let   consecutiveFailures = 0;
   // Last per-contract event sequence seen (topics[2]), for gap detection
   // across a poll or reconnect — see contracts/stream/src/events.rs.
   let   lastSequence: bigint | undefined;

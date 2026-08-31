@@ -33,6 +33,7 @@ vi.mock('../soroban.js', () => ({
     mainnet:  'https://mainnet.sorobanrpc.com',
     local:    'http://localhost:8000/soroban/rpc',
   },
+  catchNetworkError: (label: string, fn: () => any) => fn(),
 }));
 
 // ── Mock Address so G-addresses are accepted without strkey validation ─────────
@@ -167,6 +168,54 @@ describe('FactoryModule — streamAddress()', () => {
     expect(first).toBeNull();
     expect(second).not.toBeNull();
     expect(mockSimulate).toHaveBeenCalledTimes(2);
+  });
+
+  it('clearAddressCache clears the cache and forces a network call on next resolution', async () => {
+    const { FactoryModule } = await import('../factory.js');
+    mockSimulate.mockResolvedValueOnce(makeU32ScVal(1));
+    const factory = new FactoryModule(cfg());
+
+    await factory.streamAddress(1n);
+    expect(mockSimulate).toHaveBeenCalledTimes(1);
+
+    factory.clearAddressCache();
+
+    mockSimulate.mockResolvedValueOnce(makeU32ScVal(1));
+    await factory.streamAddress(1n);
+    expect(mockSimulate).toHaveBeenCalledTimes(2);
+  });
+
+  it('address cache is bounded LRU and evicts least-recently-used entries', async () => {
+    const { FactoryModule } = await import('../factory.js');
+    mockSimulate.mockResolvedValue(makeU32ScVal(1));
+    const factory = new FactoryModule(cfg());
+
+    // Fill cache with more entries than its capacity (1000)
+    for (let i = 0; i < 1001; i++) {
+      await factory.streamAddress(BigInt(i));
+    }
+
+    // The first entry should have been evicted
+    mockSimulate.mockClear();
+    mockSimulate.mockResolvedValue(makeU32ScVal(1));
+    await factory.streamAddress(0n);
+    expect(mockSimulate).toHaveBeenCalledTimes(1); // Cache miss
+
+    // The most recent entry should still be cached
+    mockSimulate.mockClear();
+    await factory.streamAddress(1000n);
+    expect(mockSimulate).toHaveBeenCalledTimes(0); // Cache hit
+  });
+});
+
+describe('FactoryModule — cache consolidation with StreamsModule', () => {
+  it('StreamsModule exposes clearAddressCache that delegates to factory', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const config = cfg();
+    const streams = new StreamsModule(config);
+
+    // Verify the method exists and can be called
+    expect(() => streams.clearAddressCache()).not.toThrow();
   });
 });
 

@@ -14,6 +14,7 @@ import {
   DEFAULT_RPC,
 } from './soroban.js';
 import { SUPPORTED_NETWORKS, UnsupportedChainError } from './errors.js';
+import { LruMemoCache } from './lru-memo-cache.js';
 
 export class FactoryModule {
   private readonly rpcUrl:      string;
@@ -22,11 +23,12 @@ export class FactoryModule {
   private readonly callerAddr:  string;
 
   // streamId -> contract address is set once at creation and never changes,
-  // so a resolved (non-null) address can be cached for the lifetime of this
-  // module instance. This avoids re-resolving the same address on every
-  // stream operation (get/withdraw/cancel/pause/... all call streamAddress()
-  // via StreamsModule._resolveAddr, and list() fans this out over a full page).
-  private readonly addressCache = new Map<string, string>();
+  // so a resolved (non-null) address can be cached. This avoids re-resolving
+  // the same address on every stream operation (get/withdraw/cancel/pause/...
+  // all call streamAddress() via StreamsModule._resolveAddr, and list() fans
+  // this out over a full page). The cache is bounded LRU to prevent unbounded
+  // memory growth in long-lived clients (dashboards, indexers).
+  private readonly addressCache: LruMemoCache<string, string>;
 
   constructor(private readonly config: ConduitConfig) {
     // Guard against direct construction with an unsupported network, which
@@ -50,6 +52,14 @@ export class FactoryModule {
     // For read-only calls we use the keypair's public key as the fee source;
     // if no keypair, we use the zero address (simulation only — no real account needed).
     this.callerAddr = config.keypair?.publicKey() ?? ZERO_ADDR;
+    // Cache up to 1000 stream addresses; long-lived clients (dashboards,
+    // indexers) can grow larger without eviction.
+    this.addressCache = new LruMemoCache<string, string>(1000);
+  }
+
+  /** Clear the address cache. Useful for testing or manual memory management. */
+  clearAddressCache(): void {
+    this.addressCache.clear();
   }
 
   /** Total number of streams ever created through this factory. */

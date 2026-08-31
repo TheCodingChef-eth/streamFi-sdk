@@ -174,5 +174,14 @@ export class ConduitClient {
     this.config.wallet = wallet;
     this.streams.setWallet(wallet);
   }
+
+  /**
+   * Clear the address cache. Useful for testing or manual memory management.
+   * The cache stores stream ID → contract address mappings and is bounded LRU,
+   * but can be manually cleared if needed.
+   */
+  clearAddressCache(): void {
+    this.streams.clearAddressCache();
+  }
 }
 
