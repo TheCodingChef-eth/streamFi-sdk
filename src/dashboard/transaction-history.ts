@@ -728,14 +728,19 @@ export function formatAmount(amount: unknown, decimals = 7): string {
   const digits = negative ? raw.slice(1) : raw;
   if (digits === '') return '0';
 
-  const places = Math.max(0, Math.trunc(decimals));
+  const places = Number.isFinite(decimals) ? Math.max(0, Math.trunc(decimals)) : 7;
   const padded = digits.padStart(places + 1, '0');
-  const whole = padded.slice(0, padded.length - places) || '0';
+  // Strip leading zeros from the integer part (keep one) so a long all-zero
+  // input like '00000000000' does not group into '0,000' (#618).
+  const whole = (padded.slice(0, padded.length - places) || '0').replace(/^0+(?=\d)/, '');
   const fraction = places === 0 ? '' : padded.slice(padded.length - places);
   const trimmedFraction = fraction.replace(/0+$/, '');
 
   const formattedWhole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const sign = negative ? '-' : '';
+  // Never emit a signed zero ("-0"): a negative stroop value that scales to
+  // nothing is just zero (#618).
+  const isZero = formattedWhole === '0' && trimmedFraction === '';
+  const sign = negative && !isZero ? '-' : '';
 
   return trimmedFraction === ''
     ? `${sign}${formattedWhole}`
