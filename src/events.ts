@@ -223,7 +223,7 @@ export function dispatchEvent(
   const topicName = topics[0]?.sym()?.toString() ?? '';
 
   const actor    = addressField(topics[1]);
-  const sequence = topics[2] ? scValToU64(topics[2]) : 0n;
+  const sequence = topics[2] ? scValToU64(topics[2]) : undefined;
 
   switch (topicName) {
     case TOPIC.WITHDRAWN: {
