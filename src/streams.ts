@@ -52,6 +52,33 @@ import { ConduitError, RateLimitError, InsufficientBalanceError, StreamErrorCode
  * Tracks which v1-deprecated methods have already warned this session, so
  * repeated calls (e.g. in a hot loop) do not spam the console.
  */
+/** Default concurrency limit for bounded page-fetching (Issue #549). */
+const DEFAULT_LIST_CONCURRENCY = 8;
+
+/**
+ * Runs `fn` over `items` with at most `concurrency` in-flight calls.
+ * Preserves result ordering to match a naive `Promise.all` fan-out.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 const _warnedDeprecations = new Set<string>();
 
 /**
@@ -613,8 +640,10 @@ export class StreamsModule {
       // call would serially resolve the address and then simulate — 2 serial
       // RPCs per stream. Pre-warming collapses the address lookups into a
       // single parallel fan-out before the info simulations begin.
-      await Promise.all(ids.map(id => this._resolveAddr(id)));
-      const streams = await Promise.all(ids.map(id => this.get(id)));
+      // Bounded concurrency (#549) avoids hammering the RPC endpoint with
+      // up to 100 simultaneous simulateTransaction requests.
+      await mapWithConcurrency(ids, DEFAULT_LIST_CONCURRENCY, (id) => this._resolveAddr(id));
+      const streams = await mapWithConcurrency(ids, DEFAULT_LIST_CONCURRENCY, (id) => this.get(id));
       const hasNextPage = hasNextPageOverride ?? ids.length === limit;
       const totalCount = BigInt(offset + ids.length);
       return {
