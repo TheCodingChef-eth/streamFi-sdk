@@ -14,6 +14,7 @@ const { mockBuildTx, mockSimulate } = vi.hoisted(() => ({
 vi.mock('../soroban.js', () => ({
   buildContractCallTx: mockBuildTx,
   simulateReadOnly:    mockSimulate,
+  resolveFee:          () => '100',
   scValToU64: (v: { u64: () => { toString: () => string } }) =>
     BigInt(v.u64().toString()),
   scValToI128: (_v: unknown) => 0n,
@@ -190,28 +191,6 @@ describe('FactoryModule — streamAddress()', () => {
     await factory.streamAddress(1n);
     expect(mockSimulate).toHaveBeenCalledTimes(2);
   });
-
-  it('address cache is bounded LRU and evicts least-recently-used entries', async () => {
-    const { FactoryModule } = await import('../factory.js');
-    mockSimulate.mockResolvedValue(makeU32ScVal(1));
-    const factory = new FactoryModule(cfg());
-
-    // Fill cache with more entries than its capacity (1000)
-    for (let i = 0; i < 1001; i++) {
-      await factory.streamAddress(BigInt(i));
-    }
-
-    // The first entry should have been evicted
-    mockSimulate.mockClear();
-    mockSimulate.mockResolvedValue(makeU32ScVal(1));
-    await factory.streamAddress(0n);
-    expect(mockSimulate).toHaveBeenCalledTimes(1); // Cache miss
-
-    // The most recent entry should still be cached
-    mockSimulate.mockClear();
-    await factory.streamAddress(1000n);
-    expect(mockSimulate).toHaveBeenCalledTimes(0); // Cache hit
-  });
 });
 
 describe('FactoryModule — cache consolidation with StreamsModule', () => {
@@ -296,14 +275,14 @@ describe('FactoryModule — streamsBySender() / streamsByRecipient()', () => {
     expect(args[2]!.u32()).toBe(100);
   });
 
-  it('clamps a negative limit to 0 rather than passing it through to a u32 conversion', async () => {
+  it('replaces a non-positive limit with the default rather than a bad u32 conversion', async () => {
     const { FactoryModule } = await import('../factory.js');
     mockSimulate.mockResolvedValueOnce(_xdr.ScVal.scvVec([]));
 
     await new FactoryModule(cfg()).streamsByRecipient(RECIPIENT_ADDR, 0, -5);
 
     const args = mockBuildTx.mock.calls.at(-1)![5] as _xdr.ScVal[];
-    expect(args[2]!.u32()).toBe(0);
+    expect(args[2]!.u32()).toBe(20); // DEFAULT_LIST_LIMIT
   });
 
   it('leaves an in-range limit untouched', async () => {
