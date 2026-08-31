@@ -556,6 +556,32 @@ calculateRate('1000', 2592000) // → 38580n  (stroops/sec)
 streamProgress(stream)         // → 0.42
 ```
 
+### `AbortSignal` & timeouts
+
+Methods that do network I/O (`GraphQLIndexer.query`, batch/builder submission,
+...) accept an optional `signal: AbortSignal`. To bound one by time, pass
+`AbortSignal.timeout(ms)` — but note it needs **Node >= 17.3**, Deno >= 1.20,
+Chrome >= 103, Firefox >= 100, or Safari >= 15.4.
+
+For older runtimes use the SDK's `timeoutSignal(ms)` helper (native when
+available, `AbortController` + `setTimeout` otherwise):
+
+```typescript
+import { timeoutSignal } from '@conduit-protocol/sdk';
+
+const data = await indexer.query({ query: GET_STREAMS, signal: timeoutSignal(5_000) });
+```
+
+Or hand-roll the polyfill:
+
+```typescript
+function timeoutSignal(ms: number): AbortSignal {
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+```
+
 ---
 
 ## Types
