@@ -143,18 +143,29 @@ export class NonceManager {
       throw new Error('NonceManager has been destroyed');
     }
 
-    while (this.isLocked) {
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    const start = Date.now();
+    while (this.isLocked && Date.now() - start < 5000) {
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
     }
 
     this.currentNonce = nonce !== undefined ? this.toSafeBigInt(nonce) : 0n;
     this.acquiredNonces.clear();
+    
+    const resetError = new Error('NonceManager reset');
+    for (const entry of this.lockQueue) {
+      entry.reject(resetError);
+    }
     this.lockQueue = [];
     this.isLocked = false;
   }
 
   destroy(): void {
     this.isDestroyed = true;
+    
+    const destroyError = new Error('NonceManager destroyed');
+    for (const entry of this.lockQueue) {
+      entry.reject(destroyError);
+    }
     this.lockQueue = [];
     this.isLocked = false;
     this.acquiredNonces.clear();
