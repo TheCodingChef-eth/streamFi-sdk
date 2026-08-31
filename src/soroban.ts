@@ -17,7 +17,8 @@ import {
 } from '@stellar/stellar-sdk';
 import type { Network } from './types/index.js';
 import type { Signer } from './signer.js';
-import { RateLimitError, StreamFiNetworkError, InsufficientBalanceError } from './errors.js';\nimport { withRetry } from './with-retry.js';
+import { RateLimitError, StreamFiNetworkError, InsufficientBalanceError } from './errors.js';
+import { withRetry } from './with-retry.js';
 
 // ── RPC Server cache ─────────────────────────────────────────────────────────
 // Reusing SorobanRpc.Server instances avoids creating a new HTTP agent per

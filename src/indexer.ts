@@ -198,7 +198,7 @@ export class GraphQLIndexer {
   private async executeGraphQLRequest(
     fetchFn: typeof fetch,
     headers: Record<string, string>,
-    payload: { query: string | null; variables: Record<string, unknown>; extensions?: PersistedQueryExtensions },
+    payload: { query: string | null; variables: Record<string, unknown>; extensions?: PersistedQueryExtensions | undefined },
     timeoutMs: number | undefined,
     callerSignal?: AbortSignal,
   ): Promise<{ data?: unknown; errors?: unknown[] }> {

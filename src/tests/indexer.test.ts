@@ -26,7 +26,7 @@ describe('GraphQLIndexer APQ', () => {
 
     expect(result).toEqual({ streamCount: 5 });
     expect(fetchFn).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(fetchFn.mock.calls[0][1].body);
+    const body = JSON.parse(fetchFn.mock.calls[0]![1].body);
     expect(body.query).toBeNull();
     expect(body.extensions).toMatchObject({
       persistedQuery: { version: 1, sha256Hash: expect.stringMatching(/^[a-f0-9]{64}$/) },
@@ -51,7 +51,7 @@ describe('GraphQLIndexer APQ', () => {
 
     expect(result).toEqual({ streamCount: 3 });
     expect(fetchFn).toHaveBeenCalledTimes(2);
-    const fallbackBody = JSON.parse(fetchFn.mock.calls[1][1].body);
+    const fallbackBody = JSON.parse(fetchFn.mock.calls[1]![1].body);
     expect(fallbackBody.query).toBe('query { streamCount }');
     expect(fallbackBody.extensions).toBeDefined();
   });
@@ -66,7 +66,7 @@ describe('GraphQLIndexer APQ', () => {
     globalThis.fetch = fetchFn as unknown as typeof fetch;
     await indexer.query({ query: 'query { streamCount }', persist: false });
 
-    const body = JSON.parse(fetchFn.mock.calls[0][1].body);
+    const body = JSON.parse(fetchFn.mock.calls[0]![1].body);
     expect(body.query).toBe('query { streamCount }');
     expect(body.extensions).toBeUndefined();
   });

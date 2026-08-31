@@ -577,6 +577,7 @@ describe('StreamsModule — server caching', () => {
 
 describe('StreamsModule.getStreamInfos', () => {
   it('returns results and failures for a mixed fan-out', async () => {
+    const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule(makeConfig(false));
 
     const goodInfo = { id: 1n, address: 'C_GOOD' } as unknown as import('../types/index.js').StreamInfo;
@@ -597,6 +598,7 @@ describe('StreamsModule.getStreamInfos', () => {
   });
 
   it('preserves input order', async () => {
+    const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule(makeConfig(false));
     vi.spyOn(sdk, 'get').mockImplementation(async (id) => ({
       id: BigInt(id),
