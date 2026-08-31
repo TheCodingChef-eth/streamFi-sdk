@@ -122,6 +122,21 @@ export interface PaginatedStreams {
   nextCursor?: string;
 }
 
+export interface GetStreamInfosOptions {
+  /** Maximum number of concurrent RPC simulations. Defaults to 8. */
+  maxConcurrency?: number;
+}
+
+export interface GetStreamInfosFailure {
+  id:    bigint;
+  error: string;
+}
+
+export interface GetStreamInfosResult {
+  results:  StreamInfo[];
+  failures: GetStreamInfosFailure[];
+}
+
 export interface GovernorConfig {
   feeBps:              number;
   feeRecipient?:       string;
