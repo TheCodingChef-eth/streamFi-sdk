@@ -20,6 +20,14 @@ export interface GraphQLQueryOptions {
    * `Infinity` to disable the SDK timeout entirely.
    */
   timeoutMs?: number;
+  /**
+   * Whether to use Automatic Persisted Queries (APQ). When `true` (default),
+   * the client first sends a SHA-256 hash of the query and only falls back
+   * to sending the full query string if the server reports
+   * `PERSISTED_QUERY_NOT_FOUND`. Set to `false` to always send the full
+   * query, e.g. for one-off queries the server has never seen.
+   */
+  persist?: boolean;
 }
 
 export interface GraphQLSubscriptionOptions {
@@ -44,6 +52,17 @@ export interface IndexerSubscription {
  * hands back `any`, which would silently defeat `noImplicitAny` for every
  * property read below.
  */
+/**
+ * APQ extension payload sent in place of the full query string when the
+ * indexer supports Automatic Persisted Queries.
+ */
+interface PersistedQueryExtensions {
+  persistedQuery: {
+    version: 1;
+    sha256Hash: string;
+  };
+}
+
 interface GraphQLServerMessage {
   type?: unknown;
   payload?: unknown;
@@ -57,6 +76,37 @@ interface GraphQLServerMessage {
  * `dashboard/transaction-history.ts` and `examples/dashboard/.../apollo-client.ts`).
  */
 export const DEFAULT_INDEXER_TIMEOUT_MS = 15_000;
+/**
+ * Computes the SHA-256 hex digest of `input` using the Web Crypto API,
+ * falling back to Node's `crypto` module when `crypto.subtle` is not
+ * available. Required for APQ hash generation.
+ */
+async function sha256hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const buffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buffer))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  // Node.js < 19 fallback: the dynamic import is only evaluated when the
+  // Web Crypto API is absent, so bundlers targeting modern browsers can elide it.
+  const { createHash } = await import('node:crypto');
+  return createHash('sha256').update(input).digest('hex');
+}
+
+function isPersistedQueryNotFound(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const errors = (body as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some(
+    (error) =>
+      error &&
+      typeof error === 'object' &&
+      ((error as { message?: string }).message ?? '').includes('PERSISTED_QUERY_NOT_FOUND'),
+  );
+}
+
 
 export class GraphQLIndexer {
   private endpoint: string;
@@ -98,23 +148,30 @@ export class GraphQLIndexer {
       throw new Error('Fetch API is not available in the current environment');
     }
 
-    const response = await this.fetchWithTimeout(
+    const persist = options.persist !== false;
+    const extensions: PersistedQueryExtensions | undefined = persist
+      ? { persistedQuery: { version: 1, sha256Hash: await sha256hex(options.query) } }
+      : undefined;
+
+    let body = await this.executeGraphQLRequest(
       fetchFn,
-      this.endpoint,
       headers,
-      JSON.stringify({ query: options.query, variables }),
+      { query: persist ? null : options.query, variables, extensions },
       options.timeoutMs,
       options.signal,
     );
 
-    if (!response.ok) {
-      throw new Error(`GraphQL query failed with status ${response.status}: ${response.statusText}`);
+    // APQ fallback: the server has not seen this query hash yet, so replay
+    // with the full query string plus the hash so the server can cache it.
+    if (persist && isPersistedQueryNotFound(body)) {
+      body = await this.executeGraphQLRequest(
+        fetchFn,
+        headers,
+        { query: options.query, variables, extensions },
+        options.timeoutMs,
+        options.signal,
+      );
     }
-
-    const body = (await response.json()) as {
-      data?: unknown;
-      errors?: unknown[];
-    };
 
     if (Array.isArray(body?.errors) && body.errors.length > 0) {
       const messages = body.errors
@@ -134,6 +191,34 @@ export class GraphQLIndexer {
   }
 
   /**
+   * Issues a single GraphQL POST and parses the JSON response. Extracted so
+   * APQ can retry with the full query string without duplicating fetch,
+   * timeout, and error-handling logic.
+   */
+  private async executeGraphQLRequest(
+    fetchFn: typeof fetch,
+    headers: Record<string, string>,
+    payload: { query: string | null; variables: Record<string, unknown>; extensions?: PersistedQueryExtensions },
+    timeoutMs: number | undefined,
+    callerSignal?: AbortSignal,
+  ): Promise<{ data?: unknown; errors?: unknown[] }> {
+    const response = await this.fetchWithTimeout(
+      fetchFn,
+      this.endpoint,
+      headers,
+      JSON.stringify(payload),
+      timeoutMs,
+      callerSignal,
+    );
+
+    if (!response.ok) {
+      throw new Error(`GraphQL query failed with status ${response.status}: ${response.statusText}`);
+    }
+
+    return (await response.json()) as { data?: unknown; errors?: unknown[] };
+  }
+
+    /**
    * Runs a single GraphQL POST against the indexer, combining the SDK's
    * default timeout (or the caller's `timeoutMs`) with any caller-supplied
    * `AbortSignal`. If the request does not complete within the time window
