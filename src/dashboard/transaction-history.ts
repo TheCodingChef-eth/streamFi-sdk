@@ -213,7 +213,21 @@ function toIso8601(value: string): string {
 function asTimestamp(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     // Indexers emit seconds for `createdAt`; normalise to milliseconds.
-    return value < 1e12 ? Math.trunc(value) * 1000 : Math.trunc(value);
+    // Use digit count to disambiguate: 10 digits ⇒ seconds, 13 digits ⇒ ms.
+    // This avoids the pre-2001 ms misclassification of the old < 1e12 check.
+    const abs = Math.abs(value);
+    if (abs >= 1e9 && abs < 1e10) {
+      // 10 digits: seconds epoch (1970–2033 range)
+      return Math.trunc(value) * 1000;
+    }
+    if (abs >= 1e12 && abs < 1e13) {
+      // 13 digits: milliseconds epoch
+      return Math.trunc(value);
+    }
+    // Ambiguous digit count (e.g. 11-12 digits): fall through to existing
+    // callers — they already handle numeric timestamps in a context-dependent
+    // way, and the ambiguous band is small relative to the pre-2001 breakage.
+    return Math.trunc(value);
   }
   if (typeof value === 'string' && value.trim() !== '') {
     const trimmed = value.trim();

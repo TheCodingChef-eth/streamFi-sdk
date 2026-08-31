@@ -132,12 +132,12 @@ export interface GovernorConfig {
 
 // ── Events ──────────────────────────────────────────────────────────────────
 
-export interface WithdrawEvent  { amount: bigint; recipient: string; totalWithdrawn: bigint; remaining: bigint; sequence: bigint; }
-export interface CancelEvent    { refundAmount: bigint; withdrawnSoFar: bigint; sender: string; sequence: bigint; }
-export interface PauseEvent     { pausedAt: number; withdrawable: bigint; sender: string; sequence: bigint; }
-export interface ResumeEvent    { resumedAt: number; sender: string; sequence: bigint; }
-export interface TopUpEvent     { amount: bigint; newBalance: bigint; sender: string; sequence: bigint; }
-export interface ClawbackEvent  { amount: bigint; sender: string; sequence: bigint; }
+export interface WithdrawEvent  { amount: bigint; recipient: string; totalWithdrawn: bigint; remaining: bigint; sequence?: bigint; }
+export interface CancelEvent    { refundAmount: bigint; withdrawnSoFar: bigint; sender: string; sequence?: bigint; }
+export interface PauseEvent     { pausedAt: number; withdrawable: bigint; sender: string; sequence?: bigint; }
+export interface ResumeEvent    { resumedAt: number; sender: string; sequence?: bigint; }
+export interface TopUpEvent     { amount: bigint; newBalance: bigint; sender: string; sequence?: bigint; }
+export interface ClawbackEvent  { amount: bigint; sender: string; sequence?: bigint; }
 
 /** Published once when the factory deploys a new DripStream (`created` topic). */
 export interface CreatedEvent {
