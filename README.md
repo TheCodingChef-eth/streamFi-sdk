@@ -20,32 +20,44 @@ npm install @conduit-protocol/sdk
 
 ## Quickstart
 
+A complete, copy-pasteable create -> withdraw script on **testnet**. A runnable
+version lives at [`examples/quickstart.ts`](examples/quickstart.ts).
+
 ```typescript
 import { ConduitClient, fromStroops } from '@conduit-protocol/sdk';
 import { Keypair } from '@stellar/stellar-sdk';
 
+// Generate a testnet key and fund it once:
+//   const kp = Keypair.random();
+//   await fetch(`https://friendbot.stellar.org?addr=${kp.publicKey()}`);
+const keypair = Keypair.fromSecret(process.env.STELLAR_SECRET!);
+
 const client = new ConduitClient({
-  network:  'testnet',
-  keypair:  Keypair.fromSecret('S...'),
+  network:        'testnet',
+  keypair,
+  factoryAddress: process.env.FACTORY_ADDRESS!,   // testnet DripFactory contract id
 });
 
-// Create a 30-day USDC stream
-const { streamId } = await client.streams.create({
-  recipient:       'GABC...XYZ',
-  token:           'USDC',
-  depositAmount:   '1000',              // 1 000 USDC
-  durationSeconds: 30 * 24 * 3600,     // 30 days
-});
+async function main() {
+  // Stream 100 XLM to the recipient over one hour (the 1-hour minimum).
+  const { streamId, txHash } = await client.streams.create({
+    recipient:       keypair.publicKey(),   // self, for a runnable demo
+    token:           'native',              // XLM
+    depositAmount:   '100',
+    durationSeconds: 60 * 60,
+  });
+  console.log('stream', streamId, 'created  (tx', txHash + ')');
 
-console.log('Stream created:', streamId);
-// Recipient earns ≈ 0.000386 USDC / second
+  // Let value accrue, then withdraw the full available balance as the recipient.
+  await new Promise((r) => setTimeout(r, 15_000));
+  const available = await client.streams.withdrawable(streamId);
+  console.log('withdrawable:', fromStroops(available), 'XLM');
 
-// Check withdrawable balance (in stroops — the token's smallest unit)
-const available = await client.streams.withdrawable(streamId);
-console.log('Available:', fromStroops(available), 'USDC');
+  const withdrawTx = await client.streams.withdraw(streamId, available);
+  console.log('withdrawn  (tx', withdrawTx + ')');
+}
 
-// Withdraw
-await client.streams.withdraw(streamId, available);
+main().catch(console.error);
 ```
 
 ---
