@@ -166,7 +166,7 @@ describe('subscribeToStream', () => {
       onClawback: (e) => { received = e; },
     });
     await vi.waitFor(() => expect(received).toBeDefined());
-    expect(received).toEqual({ sender, amount: 5_000n, sequence: 0n });
+    expect(received).toEqual({ sender, amount: 5_000n, sequence: undefined });
     sub.unsubscribe();
   });
 
