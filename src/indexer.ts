@@ -307,6 +307,7 @@ export class GraphQLIndexer {
         return;
       }
       ws = socket;
+      let queuedSubscribeMessage: string | null = null;
 
       socket.onopen = () => {
         if (unsubscribed || this.isDestroyed) {
@@ -316,16 +317,14 @@ export class GraphQLIndexer {
         reconnectAttempts = 0;
         try {
           socket.send(JSON.stringify({ type: 'connection_init' }));
-          socket.send(
-            JSON.stringify({
-              id: subId,
-              type: 'subscribe',
-              payload: {
-                query: options.query,
-                variables,
-              },
-            })
-          );
+          queuedSubscribeMessage = JSON.stringify({
+            id: subId,
+            type: 'subscribe',
+            payload: {
+              query: options.query,
+              variables,
+            },
+          });
         } catch (err) {
           this.handleError(options.onError, err);
         }
@@ -340,6 +339,14 @@ export class GraphQLIndexer {
               : (event.data as unknown);
           if (!raw || typeof raw !== 'object') return;
           const data = raw as GraphQLServerMessage;
+
+          if (data.type === 'connection_ack') {
+            if (queuedSubscribeMessage !== null) {
+              socket.send(queuedSubscribeMessage);
+              queuedSubscribeMessage = null;
+            }
+            return;
+          }
 
           if (data.type === 'next' || data.type === 'data') {
             const payload = data.payload ?? data.data;
