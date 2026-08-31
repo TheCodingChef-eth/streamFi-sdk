@@ -675,6 +675,11 @@ export class StreamsModule {
     return subscribeToStream(this.rpcUrl, address, handlers);
   }
 
+  /** Clear the address cache. Useful for testing or manual memory management. */
+  clearAddressCache(): void {
+    this._factory.clearAddressCache();
+  }
+
   /** Synchronous subscribe - resolves address lazily on first poll tick. */
   subscribe(streamId: bigint | string, handlers: StreamEventHandlers): Subscription {
     let inner: Subscription | null = null;
@@ -764,15 +769,11 @@ export class StreamsModule {
   }
 
   private async _resolveAddr(id: bigint): Promise<string> {
-    // Return from the session cache to avoid a factory RPC on every operation
-    // for the same stream ID. Stream contract addresses are immutable once
-    // assigned by the factory, so the cache never needs invalidation.
-    const cached = this._addrCache.get(id);
-    if (cached) return cached;
-
+    // Use the factory's bounded LRU cache for address resolution.
+    // Stream contract addresses are immutable once assigned by the factory,
+    // so the cache never needs invalidation.
     const addr = await this._factory.streamAddress(id);
     if (!addr) throw new ConduitError('stream', StreamErrorCode.StreamNotFound, `Stream ${id} not found`);
-    this._addrCache.set(id, addr);
     return addr;
   }
 

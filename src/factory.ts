@@ -16,6 +16,7 @@ import {
   DEFAULT_RPC,
 } from './soroban.js';
 import { SUPPORTED_NETWORKS, UnsupportedChainError } from './errors.js';
+import { LruMemoCache } from './lru-memo-cache.js';
 
 /**
  * A `null` (not-found) `streamAddress` result is cached only briefly — a
