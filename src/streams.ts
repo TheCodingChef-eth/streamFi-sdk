@@ -31,6 +31,7 @@ import {
   catchNetworkError,
   queryXlmBalance,
   estimateRequiredFee,
+  CREATE_RESOURCE_FEE_ESTIMATE,
   DEFAULT_RPC,
   NETWORK_PASSPHRASE,
   DEFAULT_CONFIRMATION_MAX_ATTEMPTS,
@@ -258,7 +259,7 @@ export class StreamsModule {
       // query the actual XLM balance and estimate the required fee.
       if (err instanceof InsufficientBalanceError && err.currentBalance === 0n && err.requiredBalance === 0n) {
         const xlmBalance = await queryXlmBalance(this.rpcUrl, this.passphrase, senderAddr).catch(() => 0n);
-        const requiredFee = estimateRequiredFee(sim);
+        const requiredFee = estimateRequiredFee(sim, CREATE_RESOURCE_FEE_ESTIMATE);
         const required = depositStroops + requiredFee;
         throw new InsufficientBalanceError(xlmBalance, required, sim.error);
       }

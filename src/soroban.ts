@@ -513,6 +513,14 @@ export async function queryXlmBalance(
 export const DEFAULT_RESOURCE_FEE_ESTIMATE = 1_000_000n;
 
 /**
+ * Larger fallback used for expensive operations that deploy or instantiate
+ * contracts (e.g. `create_stream`). This is a conservative default sized in
+ * stroops (3 XLM) to avoid under-estimating required balance in the
+ * insufficient-balance error path when the simulation carries no fee fields.
+ */
+export const CREATE_RESOURCE_FEE_ESTIMATE = 30_000_000n;
+
+/**
  * Estimate the minimum resource fee required for a transaction simulation.
  *
  * A successful simulation reports the fee in `minResourceFee` (preferred)
