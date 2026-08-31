@@ -65,6 +65,7 @@ export {
   normalizeProgress,
   withdrawableLocal,
   bigintSafeStringify,
+  timeoutSignal,
 } from './utils.js';
 
 // RPC server lifecycle
