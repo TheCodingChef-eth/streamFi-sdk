@@ -73,7 +73,8 @@ export class Module49 {
 
     const elapsed = performance.now() - startTime;
     this.totalExecutionTimeMs += elapsed;
-    this.totalProcessed += items.length;
+    
+
 
     return results;
   }
@@ -88,8 +89,9 @@ export class Module49 {
     if (this.enableOptimization) {
       const cached = this.cache.get(cacheKey);
       if (cached) {
-        this.cacheHits++;
-        return {
+  this.cacheHits++;
+  this.totalProcessed++;
+  return {
           id: item.id,
           withdrawable: cached.withdrawable,
           progress: cached.progress,
@@ -100,8 +102,8 @@ export class Module49 {
     }
 
     this.cacheMisses++;
-    const withdrawable = withdrawableLocal(item.stream, nowSec);
-
+this.totalProcessed++;
+const withdrawable = withdrawableLocal(item.stream, nowSec);
     let progress = 0;
     const { startTime, endTime } = item.stream;
     if (nowSec >= startTime) {
