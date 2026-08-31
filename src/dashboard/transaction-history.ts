@@ -318,7 +318,7 @@ export function normalizeTransaction(
   // rendering a row with an empty React key.
   if (id === '' && hash === '') return null;
 
-  const amountRaw = record['amount'] ?? record['value'] ?? record['ratePerSecond'];
+  const amountRaw = record['amount'] ?? record['value'];
   const kind = asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN');
   const explicitDirection = asEnum(
     record['direction'],
