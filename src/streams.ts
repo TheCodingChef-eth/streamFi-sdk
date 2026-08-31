@@ -71,7 +71,7 @@ async function mapWithConcurrency<T, R>(
   async function worker() {
     while (index < items.length) {
       const i = index++;
-      results[i] = await fn(items[i]);
+      results[i] = await fn(items[i]!);
     }
   }
 

@@ -7,7 +7,7 @@ import { StrKey } from '@stellar/stellar-sdk';
  * source account to actually exist or sign anything for a read-only
  * invocation. Never used to sign or move funds.
  */
-export const ZERO_ADDR = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+export const ZERO_ADDR = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
 /**
  * Circle's USDC issuer accounts, keyed by network. Used to resolve the
@@ -15,12 +15,12 @@ export const ZERO_ADDR = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
  * #508 — the previous mainnet constant was a placeholder strkey that failed
  * checksum validation and threw on every mainnet `create({ token: 'USDC' })`
  * call), */
-export const USCC_ISSUER = {
-  testnet: 'GBBD4IFILWK7P7MDEVSWR7DPUWV3NY3DTQEVF4NAT4AQH3ZLLFLA5',
-  mainnet: 'GA5SZEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+export const USDC_ISSUER = {
+  testnet: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+  mainnet: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
 } as const;
 
-for (const [network, issuer] of Object.entries(USCC_ISSUER)) {
+for (const [network, issuer] of Object.entries(USDC_ISSUER)) {
   if (!StrKey.isValidEd25519PublicKey(issuer)) {
     throw new Error(`Invalid USDC issuer strkey configured for ${network}: "${issuer}")`);
   }

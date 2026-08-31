@@ -166,7 +166,7 @@ export class ConduitClient {
 
   /** List streams with optional filtering. */
   async listStreams(params?: ListStreamsParams): Promise<PaginatedStreams> {
-    return this.streams.list(params);
+    return this.streams.list(params ?? {});
   }
 
   /** Get the withdrawable amount for a stream. */
@@ -190,7 +190,7 @@ export class ConduitClient {
   }
 
   /** Claw back unstreamed tokens (sender only, if clawback is enabled). */
-  async clawback(streamId: string): Promise<string> {
+  async clawback(streamId: string): Promise<bigint> {
     return this.streams.clawback(streamId);
   }
 

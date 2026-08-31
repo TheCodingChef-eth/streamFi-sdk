@@ -327,6 +327,12 @@ export function normalizeTransaction(
     'UNKNOWN',
   );
 
+  const timestamp = asTimestamp(record['timestamp'] ?? record['createdAt']);
+  // When neither id nor hash is present, synthesise a composite key so
+  // distinct events on the same stream aren't treated as duplicates.
+  const synthesizedId =
+    id !== '' ? id : hash !== '' ? hash : `${streamId}:${kind}:${timestamp}`;
+
   return {
     id: synthesizedId,
     hash,
