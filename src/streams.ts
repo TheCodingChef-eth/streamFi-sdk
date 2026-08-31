@@ -170,6 +170,7 @@ export class StreamsModule {
    * Resolve the caller address, handling both sync and async getPublicKey().
    * Safe when the wallet adapter returns a promise — but it MUST only be
    * called from async contexts. Results are cached per wallet configuration
+   * once a valid public key is resolved (does not cache null/ZERO_ADDR #562)
    * and invalidated on setWallet().
    */
   private async _resolveCallerAddress(): Promise<string> {
@@ -179,7 +180,11 @@ export class StreamsModule {
     let addr: string;
     if (this.activeWallet) {
       const pk = await this.activeWallet.getPublicKey();
-      addr = pk ?? ZERO_ADDR;
+      if (pk && pk !== ZERO_ADDR) {
+        this._cachedCallerAddr = pk;
+        return pk;
+      }
+      return ZERO_ADDR;
     } else if (this.config.signer) {
       addr = this.config.signer.publicKey();
     } else if (this.config.keypair) {
@@ -187,7 +192,9 @@ export class StreamsModule {
     } else {
       addr = ZERO_ADDR;
     }
-    this._cachedCallerAddr = addr;
+    if (addr && addr !== ZERO_ADDR) {
+      this._cachedCallerAddr = addr;
+    }
     return addr;
   }
 
