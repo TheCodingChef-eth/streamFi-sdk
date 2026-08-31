@@ -82,19 +82,17 @@ async function mapWithConcurrency<T, R>(
 const _warnedDeprecations = new Set<string>();
 
 /**
- * Logs a one-time console warning for a deprecated v1 method, but only in
- * development mode. Safe to call in browser bundles: guards `process` with
- * a `typeof` check since it is not guaranteed to exist outside Node/bundlers
- * that define it at build time.
+ * Logs a one-time console warning for a deprecated v1 method, suppressed
+ * only when the environment is *provably* production. Uses optional chaining
+ * so that when `process` is absent (e.g. a plain browser bundle without a
+ * bundler shim) the expression evaluates to `undefined !== 'production'`
+ * which is `true` — warnings are shown, not silently swallowed.
  *
  * @param methodName - The deprecated method, e.g. 'StreamsModule.create()'.
  * @param replacement - The suggested replacement, e.g. 'StreamBuilder'.
  */
 function warnV1Deprecated(methodName: string, replacement: string): void {
-  const isDev =
-    typeof process !== 'undefined' &&
-    typeof process.env !== 'undefined' &&
-    process.env.NODE_ENV !== 'production';
+  const isDev = process?.env?.NODE_ENV !== 'production';
   if (!isDev) return;
   if (_warnedDeprecations.has(methodName)) return;
   _warnedDeprecations.add(methodName);
