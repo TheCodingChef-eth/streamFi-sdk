@@ -28,6 +28,17 @@ export class KeypairWalletAdapter implements WalletAdapter {
       return parsedTx.toXDR();
     }
 
+    if (
+      _opts?.networkPassphrase &&
+      tx.networkPassphrase !== undefined &&
+      tx.networkPassphrase !== _opts.networkPassphrase
+    ) {
+      throw new Error(
+        `networkPassphrase mismatch: the transaction was built for "${tx.networkPassphrase}" ` +
+          `but opts.networkPassphrase is "${_opts.networkPassphrase}".`,
+      );
+    }
+
     tx.sign(this.keypair);
     return tx;
   }
