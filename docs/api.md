@@ -20,6 +20,17 @@ new ConduitClient(config: ConduitConfig)
 | `factoryAddress` | `string` | | Deployed factory |
 | `governorAddress` | `string` | | Deployed governor |
 | `wallet` | `WalletAdapter` | | — |
+| `fee` | `string` | | Explicit inclusion (bid) fee in stroops for submitted transactions. Takes precedence over `feeMultiplier`. Defaults to `BASE_FEE` (100 stroops) |
+| `feeMultiplier` | `number` | | Multiplier applied to `BASE_FEE` to compute the inclusion fee, e.g. `10` bids 10x the network minimum. Ignored when `fee` is set |
+
+> **Inclusion fee.** Every submitted transaction previously used `BASE_FEE`
+> (the network minimum, 100 stroops) unconditionally, with no way to raise
+> it. Under inclusion-fee pressure (surge pricing, congested ledgers) a
+> 100-stroop bid is not selected, and the SDK's confirmation polling
+> eventually throws a misleading `Transaction timed out` instead of
+> surfacing "fee too low". Set `fee` (an exact stroops amount) or
+> `feeMultiplier` (a multiple of `BASE_FEE`) on `ConduitConfig` to bid
+> higher; `fee` wins if both are set.
 
 ### Convenience methods
 
@@ -83,6 +94,38 @@ const total = await client.streams.streamedTotal(streamId);
 **Returns:** Transaction hash  
 **Requires:** `keypair` set (recipient)  
 **Throws:** `Error` (client-side) if an explicit `amount` is `<= 0n` — validated before any RPC round-trip, mirroring the contract's `InvalidAmount` guard; `ConduitError` with `contract: 'stream'` — `StreamErrorCode.NothingToWithdraw`, `.NotAuthorized`, `.StreamCancelled`, `.InvalidAmount`
+
+---
+
+### `batchWithdraw(withdrawals) → Promise<BatchWithdrawResult[]>`
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `withdrawals` | `{ streamId: bigint \| string; amount?: bigint }[]` | One entry per stream to withdraw from |
+
+```typescript
+interface BatchWithdrawResult {
+  streamId: bigint;
+  success:  boolean;
+  txHash?:  string;  // present when success is true
+  error?:   string;  // present when success is false
+}
+```
+
+Withdraws from multiple streams. Soroban permits only one
+`invoke_host_function` operation per transaction, so this cannot be a single
+atomic transaction — each withdrawal is submitted as its own transaction and
+reported independently, so a failure on one streamId (e.g.
+`StreamNotFound`, insufficient balance) does not fail the others.
+
+Withdrawals are submitted **one at a time, not concurrently**. Each
+transaction is built from the caller account's current sequence number;
+submitting all N withdrawals at once means every one of them would read the
+same sequence number and collide, so with a single keypair/wallet at most
+one could ever land on-chain. Awaiting each withdrawal in turn guarantees
+every submission gets a distinct, ordered sequence number.
+
+**Requires:** `keypair`, `wallet`, or `signer` set (recipient)
 
 ---
 
@@ -203,6 +246,11 @@ const sub = client.streams.subscribe(streamId, {
   onResume:    e => console.log('Resumed at:', e.resumedAt),
   onTopUp:     e => console.log('Topped up:', e.amount),
   onClawback:  e => console.log('Clawback:', e.amount),
+  onCreated:            e => console.log('Created:', e.recipient),
+  onForceCancel:        e => console.log('Force-cancelled by:', e.recipient),
+  onRecipientTransfer:  e => console.log('Recipient transferred to:', e.newRecipient),
+  onOperatorSet:        e => console.log('Operator set:', e.operator),
+  onOperatorRevoke:     e => console.log('Operator revoked:', e.operator),
   onError:     err => console.warn('Polling error:', err),
   pollInterval:            3000,   // ms; default 5000
   maxBackoffMs:            30000,  // ms; default 60000
@@ -222,10 +270,17 @@ sub.unsubscribe();
 > **All event payload fields are decoded.** `src/events.ts`'s `dispatchEvent()` parses every
 > multi-field event from its tuple `ScVal`s: `onWithdraw` → `{ recipient, amount,
 > totalWithdrawn, remaining }`, `onCancel` → `{ sender, refundAmount, withdrawnSoFar }`,
-> `onPause` → `{ sender, pausedAt, withdrawable }`, `onTopUp` → `{ sender, amount, newBalance }`.
-> Single-field events are decoded from their bare scalar: `onResume` → `{ sender, resumedAt }`,
-> `onClawback` → `{ sender, amount }`. These fields are real values from the chain — no
-> placeholder `0`/`0n` values remain.
+> `onPause` → `{ sender, pausedAt, withdrawable }`, `onTopUp` → `{ sender, amount, newBalance }`,
+> `onCreated` → `{ sender, recipient, token, depositAmount, ratePerSecond, startTime, endTime }`,
+> `onForceCancel` → `{ recipient, payoutAmount, refundAmount }`. Single-field events are decoded
+> from their bare scalar: `onResume` → `{ sender, resumedAt }`, `onClawback` → `{ sender, amount }`,
+> `onRecipientTransfer` → `{ previousRecipient, newRecipient }`, `onOperatorSet` → `{ sender,
+> operator }`, `onOperatorRevoke` → `{ sender, operator }`. These fields are real values from the
+> chain — no placeholder `0`/`0n` values remain.
+>
+> `onRecipientTransfer`, `onForceCancel`, `onOperatorSet`, and `onOperatorRevoke` were previously
+> silently ignored — a live subscriber was never notified when the recipient role moved to
+> another address, a paused stream was force-cancelled, or an operator was delegated/revoked.
 
 The first poll seeds its start ledger from `getLatestLedger()` before calling `getEvents()` (Soroban
 RPC's `getEvents` rejects without a start ledger). If that seeding call itself fails, it's retried on
@@ -812,5 +867,33 @@ new Module49(config?: Module49Config)
 * `computeOptimizedYield(ratePerSecond: bigint, durationSecs: number): bigint` - Fast BigInt yield calculation.
 * `clearCache(): void` - Clears the internal lookup cache and metrics.
 * `getPerformanceMetrics(): Module49Metrics` - Returns real-time metrics (`totalProcessed`, `cacheHits`, `cacheMisses`, `hitRate`, `averageExecutionTimeMs`).
+
+---
+
+## `Module44` (Feature #44)
+
+Stream liquidity-risk / runway calculator implementing Feature #44. For each stream, computes the remaining `runwaySecs` until `endTime` and classifies it into a `LiquidityRiskLevel` (`'inactive' | 'critical' | 'warning' | 'healthy'`), so a dashboard can flag streams about to run out of scheduled balance. Uses the same LRU-memoized lookup pattern as `Module26`/`Module36`/`Module48`; actual speedup is workload-dependent (proportional to cache hit rate) — see `getPerformanceMetrics()` for a measured value, never a fixed assumed percentage.
+
+### Constructor
+
+```typescript
+new Module44(config?: Module44Config)
+```
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `cacheSize` | `number` | `1000` | Max entries in memoization cache |
+| `enableOptimization` | `boolean` | `true` | Enables memoized lookup caching |
+| `batchChunkSize` | `number` | `50` | Stream chunk size for batch processing |
+| `criticalThresholdSecs` | `number` | `86400` (1 day) | Runway below this is `'critical'`. Throws if negative |
+| `warningThresholdSecs` | `number` | `604800` (7 days) | Runway below this (and at/above `criticalThresholdSecs`) is `'warning'`. Throws if not greater than `criticalThresholdSecs` |
+
+### Methods
+
+* `assessSingleItem(item: StreamRiskItem): StreamRiskAssessment` — Computes one stream's `runwaySecs` and `riskLevel`. A cancelled, paused, or zero-rate stream is `'inactive'` with `runwaySecs: 0`. An open-ended stream (`endTime === 0`) is `'healthy'` with `runwaySecs: null` — its runway isn't bounded by a schedule, only by the sender keeping the balance topped up.
+* `assessBatch(items: StreamRiskItem[]): StreamRiskAssessment[]` — Assesses an array of streams in `batchChunkSize` chunks.
+* `estimateTopUpNeeded(stream: StreamInfo, targetRunwaySecs: number, nowSec?: number): bigint` — Stroops needed via `top_up()` for the stream's runway to reach `targetRunwaySecs`. Returns `0n` if the stream is inactive/paused/cancelled, the target is non-positive, or the target is already met (including any open-ended stream, whose runway is treated as unbounded).
+* `clearCache(): void` — Clears the internal lookup cache and metrics.
+* `getPerformanceMetrics(): Module44Metrics` — Returns `totalAssessed`, `cacheHits`, `cacheMisses`, `averageExecutionTimeMs`, and `measuredSpeedupPercent` (a real measurement derived from this instance's own accumulated hit/miss timings, `null` until both have occurred at least once).
 
 

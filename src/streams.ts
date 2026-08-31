@@ -36,6 +36,7 @@ import {
   DEFAULT_CONFIRMATION_MAX_ATTEMPTS,
   DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
   createRpcServer,
+  resolveFee,
 } from './soroban.js';
 import {
   STREAM_FLAG_PAUSED,
@@ -84,6 +85,12 @@ export class StreamsModule {
   private activeWallet?:       WalletAdapter;
 
   /**
+   * Inclusion (bid) fee, in stroops, for transactions this module submits.
+   * Resolved once from `config.fee` / `config.feeMultiplier` (see #509).
+   */
+  private readonly _fee: string;
+
+  /**
    * Session-scoped cache of stream ID → contract address resolutions.
    * Avoids a redundant factory RPC on every get/withdraw/cancel/pause/resume/topUp/clawback call
    * for the same stream within a single StreamsModule lifetime. The cache is
@@ -111,6 +118,7 @@ export class StreamsModule {
     this.rpcUrl     = config.rpcUrl ?? DEFAULT_RPC[config.network];
     this.passphrase = NETWORK_PASSPHRASE[config.network];
     this._factory   = new FactoryModule(config);
+    this._fee       = resolveFee(config);
 
     if (config.wallet) {
       this.activeWallet = config.wallet;
@@ -240,7 +248,7 @@ export class StreamsModule {
       boolToScVal(clawbackEnabled),
     ];
 
-    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, factoryId, 'create_stream', args);
+    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, factoryId, 'create_stream', args, this._fee);
     const server = this._server();
     const sim    = await catchNetworkError('simulateTransaction (create)', server.simulateTransaction(tx));
 
@@ -327,35 +335,45 @@ export class StreamsModule {
   }
 
   /**
-   * Withdraw from multiple streams concurrently.
+   * Withdraw from multiple streams.
    *
    * Note: Soroban currently permits only one invoke_host_function
    * operation per transaction, so this cannot be assembled into a single
    * atomic transaction the way classic Stellar payment operations can.
-   * Each withdrawal is submitted as its own transaction; they run
-   * concurrently and are reported independently so a failure on one
-   * streamId (e.g. StreamNotFound, insufficient balance) does not block
-   * or roll back the others.
+   * Each withdrawal is submitted as its own transaction; they are reported
+   * independently so a failure on one streamId (e.g. StreamNotFound,
+   * insufficient balance) does not block or fail the others.
+   *
+   * Withdrawals are submitted one at a time, not concurrently. Each
+   * withdraw() -> _invoke() -> buildContractCallTx() reads the caller
+   * account's current sequence number via getAccount() and builds a
+   * transaction on top of it. Firing all N withdrawals at once means every
+   * one of them reads the same sequence number and builds a transaction
+   * with the same value, so with a single keypair/wallet at most one
+   * submission can ever land — the rest fail with txBAD_SEQ (see #504).
+   * Awaiting each withdrawal (submit + confirm) before starting the next
+   * guarantees getAccount() only observes the sequence after the previous
+   * transaction has landed, so every submission gets a distinct, ordered
+   * sequence number.
    */
   async batchWithdraw(withdrawals: BatchWithdrawItem[]): Promise<BatchWithdrawResult[]> {
     this._ensureCanMutate();
 
-    const settled = await Promise.allSettled(
-      withdrawals.map(w => this.withdraw(w.streamId, w.amount)),
-    );
-
-    return settled.map((result, i) => {
-      const streamId = BigInt(withdrawals[i]!.streamId);
-      if (result.status === 'fulfilled') {
-        return { streamId, success: true, txHash: result.value };
+    const results: BatchWithdrawResult[] = [];
+    for (const w of withdrawals) {
+      const streamId = BigInt(w.streamId);
+      try {
+        const txHash = await this.withdraw(w.streamId, w.amount);
+        results.push({ streamId, success: true, txHash });
+      } catch (err) {
+        results.push({
+          streamId,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      const err = result.reason;
-      return {
-        streamId,
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    });
+    }
+    return results;
   }
 
   /** Cancel the stream (sender only). Settles all balances atomically. */
@@ -430,7 +448,7 @@ export class StreamsModule {
     this._ensureCanMutate();
     const addr   = await this._resolveAddr(BigInt(streamId));
     const caller = await this._getSenderAddress();
-    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, caller, addr, 'clawback', []);
+    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, caller, addr, 'clawback', [], this._fee);
     const server = this._server();
     const sim    = await catchNetworkError('simulateTransaction (clawback)', server.simulateTransaction(tx));
 
@@ -771,7 +789,7 @@ export class StreamsModule {
   /** Simulate -> assemble -> sign -> submit -> poll. Returns txHash. */
   private async _invoke(contractId: string, method: string, args: xdr.ScVal[]): Promise<string> {
     const senderAddr = await this._getSenderAddress();
-    const tx         = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, contractId, method, args);
+    const tx         = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, contractId, method, args, this._fee);
     const server     = this._server();
     const sim        = await catchNetworkError('simulateTransaction (invoke)', server.simulateTransaction(tx));
     if (SorobanRpc.Api.isSimulationError(sim)) {

@@ -145,10 +145,32 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 }
 
 /**
+ * Resolve the inclusion (bid) fee, in stroops, for a submitted transaction.
+ *
+ * An explicit `fee` always wins. Otherwise `feeMultiplier` scales
+ * `BASE_FEE`. With neither set, this returns `BASE_FEE` (the network
+ * minimum) unchanged — the previous, always-hardcoded behaviour. `BASE_FEE`
+ * alone is not competitive under inclusion-fee pressure (surge pricing,
+ * congested ledgers): the bid goes unselected, `_sendAndPoll` exhausts its
+ * poll attempts, and the caller sees a misleading "Transaction timed out"
+ * instead of "fee too low" (see #509).
+ */
+export function resolveFee(config: { fee?: string; feeMultiplier?: number }): string {
+  if (config.fee !== undefined) return config.fee;
+  if (config.feeMultiplier !== undefined) {
+    return (BigInt(BASE_FEE) * BigInt(config.feeMultiplier)).toString();
+  }
+  return BASE_FEE;
+}
+
+/**
  * Build a contract-call transaction for simulate or submit.
  *
  * Fetches the caller's account from the RPC to get the current sequence
  * number, then wraps the call in a TransactionBuilder.
+ *
+ * @param fee - Inclusion fee in stroops. Defaults to `BASE_FEE`; pass the
+ * result of {@link resolveFee} to honour `ConduitConfig.fee`/`feeMultiplier`.
  */
 export async function buildContractCallTx(
   rpcUrl:      string,
@@ -157,6 +179,7 @@ export async function buildContractCallTx(
   contractId:  string,
   method:      string,
   args:        xdr.ScVal[],
+  fee:         string = BASE_FEE,
 ): Promise<ReturnType<TransactionBuilder['build']>> {
   const server  = createRpcServer(rpcUrl);
 
@@ -170,7 +193,7 @@ export async function buildContractCallTx(
   const contract = new Contract(contractId);
 
   return new TransactionBuilder(account, {
-    fee:            BASE_FEE,
+    fee,
     networkPassphrase: passphrase,
   })
     .addOperation(contract.call(method, ...args))

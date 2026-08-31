@@ -109,3 +109,12 @@ export type {
   Module49Metrics,
 } from './module49.js';
 
+export { Module44 } from './module44.js';
+export type {
+  Module44Config,
+  StreamRiskItem,
+  LiquidityRiskLevel,
+  StreamRiskAssessment,
+  Module44Metrics,
+} from './module44.js';
+
