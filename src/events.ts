@@ -15,10 +15,21 @@ import type {
   ResumeEvent,
   TopUpEvent,
   ClawbackEvent,
+  CreatedEvent,
+  ForceCancelEvent,
+  RecipientTransferEvent,
+  OperatorSetEvent,
+  OperatorRevokedEvent,
 } from './types/index.js';
 import { scValToI128, scValToU64, createRpcServer } from './soroban.js';
 
 // ── Event topic names (match symbol_short!() values in Rust) ─────────────────
+//
+// `created`, `force_cxl`, `xfer_rec`, `set_op` and `rm_op` are emitted by
+// contracts/stream/src/events.rs alongside the six handled below, but were
+// never wired into TOPIC/dispatchEvent — a subscriber was silently never
+// notified of a recipient transfer, a recipient-initiated force-cancel, or
+// an operator delegation/revocation (see #506).
 
 const TOPIC = {
   WITHDRAWN: 'withdrawn',
@@ -27,6 +38,11 @@ const TOPIC = {
   RESUMED:   'resumed',
   TOPPED_UP: 'topped_up',
   CLAWBACK:  'clawback',
+  CREATED:               'created',
+  FORCE_CANCELLED:       'force_cxl',
+  RECIPIENT_TRANSFERRED: 'xfer_rec',
+  OPERATOR_SET:          'set_op',
+  OPERATOR_REVOKED:      'rm_op',
 } as const;
 
 // ── Parser helpers ────────────────────────────────────────────────────────────
@@ -49,6 +65,10 @@ function i128Field(fields: xdr.ScVal[], index: number): bigint {
 function u64Field(fields: xdr.ScVal[], index: number): number {
   const field = fields[index];
   return field ? Number(scValToU64(field)) : 0;
+}
+
+function addressFieldAt(fields: xdr.ScVal[], index: number): string {
+  return addressField(fields[index]);
 }
 
 /**
@@ -305,6 +325,75 @@ export function dispatchEvent(
         sequence,
       };
       handlers.onClawback(data);
+      break;
+    }
+
+    case TOPIC.CREATED: {
+      if (!handlers.onCreated) break;
+      // data: (recipient, token, deposit_amount: i128, rate_per_second: i128, start_time: u64, end_time: u64)
+      const fields = tupleFields(event.value);
+      const data: CreatedEvent = {
+        sender:         actor,
+        recipient:      addressFieldAt(fields, 0),
+        token:          addressFieldAt(fields, 1),
+        depositAmount:  i128Field(fields, 2),
+        ratePerSecond:  i128Field(fields, 3),
+        startTime:      u64Field(fields, 4),
+        endTime:        u64Field(fields, 5),
+        sequence,
+      };
+      handlers.onCreated(data);
+      break;
+    }
+
+    case TOPIC.FORCE_CANCELLED: {
+      if (!handlers.onForceCancel) break;
+      // data: (payout_amount: i128, refund_amount: i128) — mirrors cancel()'s
+      // (refund_amount, withdrawn_so_far) shape but recipient-initiated.
+      const fields = tupleFields(event.value);
+      const data: ForceCancelEvent = {
+        recipient:    actor,
+        payoutAmount: i128Field(fields, 0),
+        refundAmount: i128Field(fields, 1),
+        sequence,
+      };
+      handlers.onForceCancel(data);
+      break;
+    }
+
+    case TOPIC.RECIPIENT_TRANSFERRED: {
+      if (!handlers.onRecipientTransfer) break;
+      // data: new_recipient: address (bare scalar, not a tuple)
+      const data: RecipientTransferEvent = {
+        previousRecipient: actor,
+        newRecipient:      addressField(event.value),
+        sequence,
+      };
+      handlers.onRecipientTransfer(data);
+      break;
+    }
+
+    case TOPIC.OPERATOR_SET: {
+      if (!handlers.onOperatorSet) break;
+      // data: operator: address (bare scalar, not a tuple)
+      const data: OperatorSetEvent = {
+        sender:   actor,
+        operator: addressField(event.value),
+        sequence,
+      };
+      handlers.onOperatorSet(data);
+      break;
+    }
+
+    case TOPIC.OPERATOR_REVOKED: {
+      if (!handlers.onOperatorRevoke) break;
+      // data: operator: address (bare scalar, not a tuple)
+      const data: OperatorRevokedEvent = {
+        sender:   actor,
+        operator: addressField(event.value),
+        sequence,
+      };
+      handlers.onOperatorRevoke(data);
       break;
     }
   }

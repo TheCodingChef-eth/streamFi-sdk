@@ -411,3 +411,39 @@ export class RpcServiceUnavailableError extends Error {
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
+
+// ── Indexer timeout ────────────────────────────────────────────────────────────
+
+/**
+ * Thrown when a `GraphQLIndexer.query()` call exceeds its time budget
+ * because the indexer is hung or too slow to respond.  The underlying
+ * `fetch` is aborted via an `AbortController` wired into the timeout.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   const data = await indexer.query({ query: '...' });
+ * } catch (err) {
+ *   if (err instanceof IndexerTimeoutError) {
+ *     console.warn(`Indexer did not respond within ${err.timeoutMs}ms`);
+ *   }
+ * }
+ * ```
+ */
+export class IndexerTimeoutError extends Error {
+  /** The indexer endpoint that timed out. */
+  readonly endpoint: string;
+  /** The timeout window in milliseconds that was exceeded. */
+  readonly timeoutMs: number;
+
+  constructor(endpoint: string, timeoutMs: number) {
+    super(
+      `GraphQL indexer query to ${endpoint} timed out after ${timeoutMs}ms. ` +
+      `The query has been aborted.`,
+    );
+    this.name = 'IndexerTimeoutError';
+    this.endpoint = endpoint;
+    this.timeoutMs = timeoutMs;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}

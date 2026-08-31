@@ -105,7 +105,16 @@ export interface TransactionHistoryState {
 
 export type TransactionHistoryAction =
   | { type: 'LOAD_START' }
-  | { type: 'LOAD_SUCCESS'; payload: unknown; receivedAt?: number }
+  | {
+      type: 'LOAD_SUCCESS';
+      payload: unknown;
+      receivedAt?: number;
+      /**
+       * Address of the connected wallet. Used to derive the viewer-relative
+       * `direction` of each row, since most indexers never emit one.
+       */
+      walletAddress?: string;
+    }
   | { type: 'LOAD_FAILURE'; error: unknown }
   | { type: 'SET_FILTER'; filter: Partial<TransactionFilters> }
   | { type: 'SET_PAGE'; page: unknown }
@@ -245,6 +254,42 @@ export function toErrorMessage(
 }
 
 // ---------------------------------------------------------------------------
+// Direction derivation
+// ---------------------------------------------------------------------------
+
+/**
+ * Derives the viewer-relative value direction from the transaction kind when
+ * the indexer does not emit an explicit `direction` (most don't — direction
+ * depends on which wallet is viewing the row, so it is not a property of the
+ * on-chain event).
+ *
+ * The connected wallet is threaded in so we only guess when it actually
+ * participates in the row, mirroring the ISSUE-566 guidance:
+ *
+ * - `WITHDRAW` — the wallet is the recipient → money flows **IN**.
+ * - `CREATE` / `TOP_UP` — the wallet is the sender → money flows **OUT**.
+ * - anything else (`PAUSE`, `RESUME`, `CANCEL`, `UNKNOWN`, …) → `UNKNOWN`.
+ *
+ * Returns `UNKNOWN` when there is no wallet (nothing to derive against) or
+ * when the kind carries no directional meaning.
+ */
+function deriveTransactionDirection(
+  kind: TransactionKind,
+  walletAddress: string,
+): TransactionDirection {
+  if (walletAddress.trim() === '') return 'UNKNOWN';
+  switch (kind) {
+    case 'WITHDRAW':
+      return 'IN';
+    case 'CREATE':
+    case 'TOP_UP':
+      return 'OUT';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Normalisation
 // ---------------------------------------------------------------------------
 
@@ -252,8 +297,16 @@ export function toErrorMessage(
  * Turns one raw indexer record into a fully-populated `TransactionRecord`.
  * Returns `null` for values that cannot possibly be a record (`null`,
  * primitives, arrays) so the caller can drop them.
+ *
+ * An explicit indexer `direction` is trusted when present; otherwise the
+ * `direction` is derived from the transaction `kind` relative to the connected
+ * `walletAddress` (see `deriveTransactionDirection`), falling back to
+ * `UNKNOWN`.
  */
-export function normalizeTransaction(raw: unknown): TransactionRecord | null {
+export function normalizeTransaction(
+  raw: unknown,
+  walletAddress?: string,
+): TransactionRecord | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
 
   const record = raw as Record<string, unknown>;
@@ -268,19 +321,21 @@ export function normalizeTransaction(raw: unknown): TransactionRecord | null {
 
   const amountRaw = record['amount'] ?? record['value'] ?? record['ratePerSecond'];
   const kind = asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN');
-  const timestamp = asTimestamp(record['timestamp'] ?? record['createdAt']);
-
-  // When neither id nor hash is present, synthesise a composite key so distinct
-  // events on the same stream aren't treated as duplicates.
-  const synthesizedId =
-    id !== '' ? id : hash !== '' ? hash : `${streamId}:${kind}:${timestamp}`;
+  const explicitDirection = asEnum(
+    record['direction'],
+    VALID_DIRECTIONS,
+    'UNKNOWN',
+  );
 
   return {
     id: synthesizedId,
     hash,
-    streamId,
+    streamId: asString(record['streamId'] ?? record['stream_id']),
     kind,
-    direction: asEnum(record['direction'], VALID_DIRECTIONS, 'UNKNOWN'),
+    direction:
+      explicitDirection !== 'UNKNOWN'
+        ? explicitDirection
+        : deriveTransactionDirection(kind, asString(walletAddress)),
     status: asEnum(record['status'], VALID_STATUSES, 'UNKNOWN'),
     amount: asString(amountRaw, '0'),
     asset: asString(record['asset'] ?? record['token'] ?? record['symbol'], 'XLM'),
@@ -294,8 +349,15 @@ export function normalizeTransaction(raw: unknown): TransactionRecord | null {
 /**
  * Normalises a whole payload. Accepts the raw GraphQL `data` object, a bare
  * array, `null`, `undefined` or garbage — and always returns an array.
+ *
+ * When a `walletAddress` is provided it is forwarded to each row's
+ * `normalizeTransaction` so viewer-relative `direction` can be derived for
+ * indexers that do not emit it.
  */
-export function normalizeTransactions(payload: unknown): TransactionRecord[] {
+export function normalizeTransactions(
+  payload: unknown,
+  walletAddress?: string,
+): TransactionRecord[] {
   let list: unknown = payload;
 
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -322,7 +384,7 @@ export function normalizeTransactions(payload: unknown): TransactionRecord[] {
   const normalized: TransactionRecord[] = [];
 
   for (const entry of list) {
-    const record = normalizeTransaction(entry);
+    const record = normalizeTransaction(entry, walletAddress);
     if (record === null) continue;
     // De-duplicate on id so a refetch racing a poll cannot produce duplicate
     // React keys.
@@ -369,7 +431,10 @@ export function transactionHistoryReducer(
       return { ...current, loading: true, error: null };
 
     case 'LOAD_SUCCESS': {
-      const transactions = normalizeTransactions(action.payload);
+      const transactions = normalizeTransactions(
+        action.payload,
+        action.walletAddress,
+      );
       const totalPages = Math.max(
         1,
         Math.ceil(transactions.length / Math.max(1, current.pageSize)),
@@ -598,11 +663,14 @@ export function selectVisibleTransactions(
   const page = clampPage(state?.page ?? 0, totalPages);
   const start = page * pageSize;
 
+  // Always use the same ordering (`topKByTimestampDesc`, which tie-breaks
+  // equal timestamps on the original index via `isLowerPriority`) so that
+  // paging through a dataset that shares timestamps never changes order
+  // part-way and duplicates/skips rows across the page boundary (#567).
+  // The function is O(n log k) and degrades to a full sort for deep pages,
+  // so there is no cost to using it uniformly.
   const k = start + pageSize;
-  const top =
-    k < filtered.length * 0.5
-      ? topKByTimestampDesc(filtered, k)
-      : [...filtered].sort((a, b) => b.timestamp - a.timestamp);
+  const top = topKByTimestampDesc(filtered, k);
   return top.slice(start, start + pageSize);
 }
 
@@ -645,11 +713,20 @@ export function formatAddress(address: unknown, visible = 6): string {
   return `${value.slice(0, head)}…${value.slice(-4)}`;
 }
 
-/** Stroops → decimal string. Falls back to `'0'` on unparseable input. */
+/**
+ * Stroops → decimal string. Falls back to `'0'` on unparseable input.
+ *
+ * `raw` must be a strict integer string (`/^-?\d+$/`) — fractional values
+ * (`"1.5"`), grouped values (`"1,000"`), or any other non-digit characters
+ * are rejected rather than stripped, since silently discarding a `.` or `,`
+ * would mis-scale the amount instead of failing loudly.
+ */
 export function formatAmount(amount: unknown, decimals = 7): string {
   const raw = asString(amount, '0').trim();
+  if (!/^-?\d+$/.test(raw)) return '0';
+
   const negative = raw.startsWith('-');
-  const digits = (negative ? raw.slice(1) : raw).replace(/[^0-9]/g, '');
+  const digits = negative ? raw.slice(1) : raw;
   if (digits === '') return '0';
 
   const places = Math.max(0, Math.trunc(decimals));

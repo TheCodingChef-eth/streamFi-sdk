@@ -9,14 +9,24 @@ import type {
   ResumeEvent,
   TopUpEvent,
   ClawbackEvent,
+  CreatedEvent,
+  ForceCancelEvent,
+  RecipientTransferEvent,
+  OperatorSetEvent,
+  OperatorRevokedEvent,
 } from '../types/index.js';
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
 const actorAddress = Keypair.random().publicKey();
+const otherAddress = Keypair.random().publicKey();
 
 function topic(name: string): xdr.ScVal {
   return xdr.ScVal.scvSymbol(name);
+}
+
+function address(addr: string): xdr.ScVal {
+  return new Address(addr).toScVal();
 }
 
 function actorTopic(): xdr.ScVal {
@@ -147,6 +157,100 @@ describe('dispatchEvent — clawback', () => {
     dispatchEvent(event, handlers);
 
     expect(received).toEqual({ sender: actorAddress, amount: 300_000n, sequence: 0n });
+  });
+});
+
+// ── created: (recipient, token, deposit_amount, rate_per_second, start_time, end_time) ──
+
+describe('dispatchEvent — created', () => {
+  it('decodes the address and numeric tuple fields (#506)', () => {
+    const event = makeEvent(
+      'created',
+      tuple(address(otherAddress), address(otherAddress), i128(1_000_000n), i128(10n), u64(1_700_000_000), u64(1_700_100_000)),
+    );
+    let received: CreatedEvent | undefined;
+    const handlers: StreamEventHandlers = { onCreated: (e) => { received = e; } };
+
+    dispatchEvent(event, handlers);
+
+    expect(received).toEqual({
+      sender:        actorAddress,
+      recipient:     otherAddress,
+      token:         otherAddress,
+      depositAmount: 1_000_000n,
+      ratePerSecond: 10n,
+      startTime:     1_700_000_000,
+      endTime:       1_700_100_000,
+      sequence:      0n,
+    });
+  });
+
+  it('does not call onCreated when the handler is not registered', () => {
+    const event = makeEvent('created', tuple(address(otherAddress), address(otherAddress), i128(1n), i128(1n), u64(1), u64(2)));
+    expect(() => dispatchEvent(event, {})).not.toThrow();
+  });
+});
+
+// ── force_cxl: (payout_amount, refund_amount) ────────────────────────────────
+
+describe('dispatchEvent — force_cxl', () => {
+  it('decodes both i128 tuple fields, attributing the actor as the recipient (#506)', () => {
+    const event = makeEvent('force_cxl', tuple(i128(50_000n), i128(25_000n)));
+    let received: ForceCancelEvent | undefined;
+    const handlers: StreamEventHandlers = { onForceCancel: (e) => { received = e; } };
+
+    dispatchEvent(event, handlers);
+
+    expect(received).toEqual({
+      recipient:    actorAddress,
+      payoutAmount: 50_000n,
+      refundAmount: 25_000n,
+      sequence:     0n,
+    });
+  });
+});
+
+// ── xfer_rec: new_recipient: address (bare scalar) ───────────────────────────
+
+describe('dispatchEvent — xfer_rec', () => {
+  it('decodes the new recipient address, attributing the actor as the previous recipient (#506)', () => {
+    const event = makeEvent('xfer_rec', address(otherAddress));
+    let received: RecipientTransferEvent | undefined;
+    const handlers: StreamEventHandlers = { onRecipientTransfer: (e) => { received = e; } };
+
+    dispatchEvent(event, handlers);
+
+    expect(received).toEqual({
+      previousRecipient: actorAddress,
+      newRecipient:      otherAddress,
+      sequence:           0n,
+    });
+  });
+});
+
+// ── set_op / rm_op: operator: address (bare scalar) ──────────────────────────
+
+describe('dispatchEvent — set_op', () => {
+  it('decodes the delegated operator address (#506)', () => {
+    const event = makeEvent('set_op', address(otherAddress));
+    let received: OperatorSetEvent | undefined;
+    const handlers: StreamEventHandlers = { onOperatorSet: (e) => { received = e; } };
+
+    dispatchEvent(event, handlers);
+
+    expect(received).toEqual({ sender: actorAddress, operator: otherAddress, sequence: 0n });
+  });
+});
+
+describe('dispatchEvent — rm_op', () => {
+  it('decodes the revoked operator address (#506)', () => {
+    const event = makeEvent('rm_op', address(otherAddress));
+    let received: OperatorRevokedEvent | undefined;
+    const handlers: StreamEventHandlers = { onOperatorRevoke: (e) => { received = e; } };
+
+    dispatchEvent(event, handlers);
+
+    expect(received).toEqual({ sender: actorAddress, operator: otherAddress, sequence: 0n });
   });
 });
 

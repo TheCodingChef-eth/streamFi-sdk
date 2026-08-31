@@ -64,7 +64,7 @@ describe('subscribeToStream', () => {
     const sub = subscribeToStream('http://localhost:8000', 'CSTREAM', {});
     await vi.waitFor(() => expect(mockGetEvents).toHaveBeenCalled());
     expect(mockGetLatestLedger).toHaveBeenCalledTimes(1);
-    expect(mockGetEvents.mock.calls[0]?.[0]).toHaveProperty('startLedger', 100);
+    expect(mockGetEvents.mock.calls[0]?.[0]).toHaveProperty('startLedger', 4242);
     sub.unsubscribe();
   });
 

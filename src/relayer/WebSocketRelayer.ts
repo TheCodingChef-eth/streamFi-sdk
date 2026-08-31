@@ -54,7 +54,12 @@ export class WebSocketRelayer {
   get state(): RelayerState {
     return {
       connected: this.ws !== null && this.ws.readyState === 1,
-      reconnecting: this.reconnectAttempts > 0,
+      reconnecting:
+        !this.isDestroyed &&
+        !this.reconnectExhausted &&
+        this.reconnectEnabled &&
+        this.reconnectAttempts > 0 &&
+        (!this.ws || this.ws.readyState !== 1),
       destroyed: this.isDestroyed,
       pendingCount: this.pendingMessages.length,
     };
@@ -99,6 +104,7 @@ export class WebSocketRelayer {
     }
     this.reconnectEnabled = true;
     this.reconnectExhausted = false;
+    this.reconnectAttempts = 0;
     if (this.connectPromise) {
       return this.connectPromise;
     }
@@ -186,9 +192,13 @@ export class WebSocketRelayer {
             settled = true;
             reject(new Error(`WebSocket connection closed before opening: ${this.url}`));
           }
-          this.emitStateChange('disconnected');
-          if (!this.isDestroyed && this.reconnectEnabled) {
+          if (!this.isDestroyed && this.reconnectEnabled && this.shouldAttemptReconnect()) {
             this.attemptReconnect();
+          } else {
+            if (this.isPermanentlyDown()) {
+              this.reconnectExhausted = true;
+            }
+            this.emitStateChange('disconnected');
           }
         };
 
@@ -278,12 +288,19 @@ export class WebSocketRelayer {
       if (this.isPermanentlyDown()) {
         this.reconnectExhausted = true;
       }
+      this.emitStateChange('disconnected');
       return;
     }
 
     await this.acquireLock();
     try {
-      if (!this.shouldAttemptReconnect()) return;
+      if (!this.shouldAttemptReconnect()) {
+        if (this.isPermanentlyDown()) {
+          this.reconnectExhausted = true;
+        }
+        this.emitStateChange('disconnected');
+        return;
+      }
 
       this.reconnectAttempts++;
       this.emitStateChange('reconnecting');
@@ -402,6 +419,7 @@ export class WebSocketRelayer {
   destroy(): void {
     this.isDestroyed = true;
     this.reconnectEnabled = false;
+    this.reconnectExhausted = true;
     this.connectPromise = null;
     this.pendingMessages = [];
     this.reconnectAttempts = this.maxReconnectAttempts;

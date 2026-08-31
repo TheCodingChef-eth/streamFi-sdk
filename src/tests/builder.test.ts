@@ -202,4 +202,24 @@ describe('StreamBuilder', () => {
     await p1;
     await p2;
   });
+
+  it('accepts Soroban contract addresses (C...) for sender and recipient (#512)', () => {
+    const contractSender = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+    const contractRecipient = 'CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ';
+    const token = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+
+    const builder = new StreamBuilder()
+      .token(token)
+      .sender(contractSender)
+      .recipient(contractRecipient)
+      .amount(1000)
+      .ratePerSecond(10n);
+
+    const stream = builder.build();
+    expect(stream.sender).toBe(contractSender);
+    expect(stream.recipient).toBe(contractRecipient);
+
+    const args = builder.toContractArgs();
+    expect(args).toHaveLength(8);
+  });
 });

@@ -12,6 +12,7 @@ const MAX_SAFE_U64 = 18446744073709551615n;
 
 interface QueueEntry {
   resolve: (value: NonceLock) => void;
+  reject: (error: Error) => void;
   cancelled: boolean;
 }
 
@@ -79,9 +80,10 @@ export class NonceManager {
    * out `acquireWithFallback`) never leaves the lock permanently held.
    */
   private enqueue(): { promise: Promise<NonceLock>; cancel: () => void } {
-    const entry: QueueEntry = { resolve: () => undefined, cancelled: false };
-    const promise = new Promise<NonceLock>((resolve) => {
+    const entry: QueueEntry = { resolve: () => undefined, reject: () => undefined, cancelled: false };
+    const promise = new Promise<NonceLock>((resolve, reject) => {
       entry.resolve = resolve;
+      entry.reject = reject;
     });
     this.lockQueue.push(entry);
     return { promise, cancel: () => { entry.cancelled = true; } };
@@ -112,8 +114,13 @@ export class NonceManager {
       next = this.lockQueue.shift();
     }
     if (next) {
-      const lock = this.nextNonce();
-      next.resolve(lock);
+      try {
+        const lock = this.nextNonce();
+        next.resolve(lock);
+      } catch (err) {
+        this.isLocked = false;
+        next.reject(err instanceof Error ? err : new Error(String(err)));
+      }
     } else {
       this.isLocked = false;
     }
@@ -194,24 +201,86 @@ export class NonceManager {
     }
   }
 
-  /** Safe acquisition with retry logic and exponential backoff. */
+  /**
+   * Safe acquisition with bounded waiting and exponential backoff between
+   * patience windows.
+   *
+   * Unlike a naive retry over {@link acquireWithFallback} — which `enqueue()`s
+   * a fresh waiter on every attempt, leaving cancelled entries in `lockQueue`
+   * and sending a retrying caller to the *back* of the line each time, so a
+   * caller that keeps just missing the window can be starved (#572) — this
+   * enqueues **exactly one** waiter. That waiter keeps its queue position
+   * across every attempt; a timed-out attempt just extends how long we wait
+   * on the same slot. The waiter is only cancelled once every retry is
+   * exhausted.
+   *
+   * @param retries              number of patience windows
+   * @param delayMs              base backoff between windows (× attempt number)
+   * @param perAttemptTimeoutMs  how long each window waits before backing off
+   */
   async safeAcquire(
     retries = 3,
     delayMs = 100,
+    perAttemptTimeoutMs = 5000,
   ): Promise<NonceLock> {
+    if (this.isDestroyed) {
+      throw new Error('NonceManager has been destroyed');
+    }
+
+    // Fast path — the lock is free right now.
+    if (!this.isLocked) {
+      this.isLocked = true;
+      return this.nextNonce();
+    }
+
+    const { promise, cancel } = this.enqueue();
+
+    // If the lock frees while we are between attempts (during a backoff
+    // sleep), `releaseLock` resolves `promise` with the nonce even though
+    // nothing is awaiting it at that instant. Record it so we hand it back
+    // instead of cancelling — cancelling then would leak the held lock.
+    let handedLock: NonceLock | null = null;
+    void promise.then(
+      (lock) => {
+        handedLock = lock;
+      },
+      () => undefined,
+    );
+
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt < retries; attempt++) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `NonceManager: acquire attempt ${attempt + 1}/${retries} timed out after ${perAttemptTimeoutMs}ms`,
+              ),
+            ),
+          perAttemptTimeoutMs,
+        );
+      });
+
       try {
-        return await this.acquireWithFallback();
+        const lock = await Promise.race([promise, timeoutPromise]);
+        if (timer) clearTimeout(timer);
+        return lock;
       } catch (err) {
+        if (timer) clearTimeout(timer);
         lastError = err instanceof Error ? err : new Error(String(err));
+        // The single waiter is still queued (not cancelled) — just wait a
+        // bit longer on the same slot.
         if (attempt < retries - 1) {
-          await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+          await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+          if (handedLock) return handedLock;
         }
       }
     }
 
+    if (handedLock) return handedLock;
+    cancel();
     throw lastError ?? new Error('NonceManager: safeAcquire failed');
   }
 }

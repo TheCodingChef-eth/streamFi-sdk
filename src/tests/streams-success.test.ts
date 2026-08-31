@@ -491,7 +491,56 @@ describe('StreamsModule.transferRecipient() — success path', () => {
     await runThroughFirstPoll(() => sdk.transferRecipient(1n, newRecipient));
     expect(buildContractCallTx).toHaveBeenCalledWith(
       expect.any(String), expect.any(String), expect.any(String),
-      STREAM_ADDR, 'transfer_recipient', [expect.anything()],
+      STREAM_ADDR, 'transfer_recipient', [expect.anything()], expect.any(String),
+    );
+  });
+});
+
+describe('StreamsModule — configurable inclusion fee (#509)', () => {
+  beforeEach(() => {
+    mockStreamAddress.mockResolvedValue(STREAM_ADDR);
+    mockSimulate.mockResolvedValue(simSuccess(xdr.ScVal.scvVoid()));
+    mockGetTransaction.mockResolvedValue(txSuccess());
+  });
+
+  it('passes BASE_FEE by default to buildContractCallTx for a submitted operation', async () => {
+    const { buildContractCallTx } = await import('../soroban.js');
+    const { StreamsModule } = await import('../streams.js');
+    const { BASE_FEE } = await import('@stellar/stellar-sdk');
+    const sdk = new StreamsModule(makeConfig());
+
+    await runThroughFirstPoll(() => sdk.pause(1n));
+
+    expect(buildContractCallTx).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(String),
+      STREAM_ADDR, 'pause', [], BASE_FEE,
+    );
+  });
+
+  it('honours an explicit config.fee override', async () => {
+    const { buildContractCallTx } = await import('../soroban.js');
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig({ fee: '5000' }));
+
+    await runThroughFirstPoll(() => sdk.pause(1n));
+
+    expect(buildContractCallTx).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(String),
+      STREAM_ADDR, 'pause', [], '5000',
+    );
+  });
+
+  it('honours config.feeMultiplier scaled off BASE_FEE', async () => {
+    const { buildContractCallTx } = await import('../soroban.js');
+    const { StreamsModule } = await import('../streams.js');
+    const { BASE_FEE } = await import('@stellar/stellar-sdk');
+    const sdk = new StreamsModule(makeConfig({ feeMultiplier: 10 }));
+
+    await runThroughFirstPoll(() => sdk.pause(1n));
+
+    expect(buildContractCallTx).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(String),
+      STREAM_ADDR, 'pause', [], (BigInt(BASE_FEE) * 10n).toString(),
     );
   });
 });

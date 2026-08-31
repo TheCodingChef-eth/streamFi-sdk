@@ -362,4 +362,56 @@ describe('WebSocketRelayer — High-Concurrency Stress Tests', () => {
 
     expect(handler).toHaveBeenCalledTimes(3);
   });
+
+  it('resets reconnecting state to false and emits disconnected when reconnect attempts are exhausted (#516)', async () => {
+    class AlwaysFailingWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+
+      constructor() {
+        setTimeout(() => {
+          this.onerror?.();
+          this.onclose?.();
+        }, 0);
+      }
+    }
+
+    (global as any).WebSocket = vi.fn(function () { return new AlwaysFailingWebSocket(); }) as any;
+    const stateHistory: Array<{ transition: string; state: any }> = [];
+    const doomed = new WebSocketRelayer('ws://localhost:65533', {
+      maxReconnectAttempts: 2,
+      reconnectDelayMs: 5,
+      onStateChange: (transition, state) => {
+        stateHistory.push({ transition, state: { ...state } });
+      },
+    });
+
+    await expect(doomed.connect()).rejects.toThrow();
+
+    // Wait for all 2 reconnect attempts to complete and exhaust
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Reconnection is exhausted; reconnecting must NOT be stuck at true
+    expect(doomed.state.connected).toBe(false);
+    expect(doomed.state.reconnecting).toBe(false);
+    expect(doomed.state.destroyed).toBe(false);
+
+    // Final emitted transition must be disconnected with reconnecting: false
+    const lastEvent = stateHistory[stateHistory.length - 1];
+    expect(lastEvent?.transition).toBe('disconnected');
+    expect(lastEvent?.state.reconnecting).toBe(false);
+    expect(lastEvent?.state.connected).toBe(false);
+
+    // A fresh connect() resets the exhausted state and attempts reconnect again
+    const connectPromise = doomed.connect();
+    expect(doomed.state.reconnecting).toBe(false);
+    await expect(connectPromise).rejects.toThrow();
+
+    doomed.destroy();
+  });
 });

@@ -11,7 +11,7 @@ export interface MemoCacheMetrics {
   cacheMisses: number;
   /**
    * `(avgMissMs - avgHitMs) / avgMissMs * 100`, measured from this
-   * instance's own accumulated hit/miss timings — not a fixed assumption.
+   * instance's own accumulated hit/miss timings - not a fixed assumption.
    * `null` until at least one hit and one miss have both been recorded.
    */
   measuredSpeedupPercent: number | null;
@@ -42,7 +42,9 @@ export class LruMemoCache<K, V> {
 
   /** Insert a key, evicting the least-recently-used entry if at capacity. */
   set(key: K, value: V): void {
-    if (!this.store.has(key) && this.store.size >= this.maxSize) {
+    if (this.store.has(key)) {
+      this.store.delete(key);
+    } else if (this.store.size >= this.maxSize) {
       const oldest = this.store.keys().next().value;
       if (oldest !== undefined) this.store.delete(oldest);
     }

@@ -105,6 +105,19 @@ describe('ConduitBatcher', () => {
       expect(result.xdrs).toEqual([]);
       expect(result.errors).toBeUndefined();
     });
+
+    it('accepts Soroban contract IDs (C...) for sender and recipient in payload (#512)', () => {
+      const contractSender = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+      const contractRecipient = 'CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ';
+      const token = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+
+      const result = batcher.execute([
+        { token, sender: contractSender, recipient: contractRecipient, amount: 100 },
+      ], { context: TEST_CONTEXT });
+
+      expect(result.success).toBe(true);
+      expect(result.operations).toBe(1);
+    });
   });
 
   describe('execute — successful batch compilation', () => {

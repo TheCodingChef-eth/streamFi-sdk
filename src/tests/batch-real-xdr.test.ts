@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Keypair, Networks, Transaction, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
+import { Keypair, Networks, Transaction, TransactionBuilder, nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import { ConduitBatcher } from '../builder.js';
 import {
   BatchBuildError,
@@ -255,8 +255,29 @@ describe('ConduitBatcher builds real XDR', () => {
       expect(paramToScVal(CONTRACT_ID).switch().name).toBe('scvAddress');
     });
 
-    it('encodes bigints as i128', () => {
-      expect(paramToScVal(42n).switch().name).toBe('scvI128');
+    it('encodes positive integers as u64 and negatives as i64 — not a blanket i128/i64', () => {
+      // Regression for #497: paramToScVal used to force every bigint to i128
+      // and every integer number to i64, which produced the wrong ScVal type
+      // for u64 contract parameters (start_time/end_time, stream IDs).
+      expect(paramToScVal(42).switch().name).toBe('scvU64');
+      expect(paramToScVal(42n).switch().name).toBe('scvU64');
+      expect(paramToScVal(0).switch().name).toBe('scvU64');
+      expect(paramToScVal(-42).switch().name).toBe('scvI64');
+      expect(paramToScVal(-42n).switch().name).toBe('scvI64');
+    });
+
+    it('honors an explicit type hint over the default inference', () => {
+      expect(paramToScVal(42n, 'i128').switch().name).toBe('scvI128');
+      expect(paramToScVal(42, 'i64').switch().name).toBe('scvI64');
+      expect(paramToScVal(42, 'u64').switch().name).toBe('scvU64');
+      expect(paramToScVal('hello', 'symbol').switch().name).toBe('scvSymbol');
+      expect(paramToScVal(SOURCE, 'string').switch().name).toBe('scvString');
+    });
+
+    it('passes already-encoded ScVals through untouched', () => {
+      const scVal = nativeToScVal(7n, { type: 'u64' });
+      expect(paramToScVal(scVal)).toBe(scVal);
+      expect(paramToScVal(scVal).switch().name).toBe('scvU64');
     });
 
     it('maps values with no ScVal representation to void instead of throwing', () => {
@@ -268,8 +289,15 @@ describe('ConduitBatcher builds real XDR', () => {
     it('passes positional args verbatim when supplied', () => {
       const args = operationToScVals({ args: [1n, SOURCE], params: { ignored: true } });
       expect(args).toHaveLength(2);
-      expect(args[0]!.switch().name).toBe('scvI128');
+      expect(args[0]!.switch().name).toBe('scvU64');
       expect(args[1]!.switch().name).toBe('scvAddress');
+    });
+
+    it('passes pre-encoded ScVals in positional args through unchanged', () => {
+      const scVal = nativeToScVal(1n, { type: 'u64' });
+      const args = operationToScVals({ args: [scVal] });
+      expect(args[0]).toBe(scVal);
+      expect(args[0]!.switch().name).toBe('scvU64');
     });
 
     it('passes params as a single sorted map when no args are given', () => {
@@ -280,6 +308,21 @@ describe('ConduitBatcher builds real XDR', () => {
 
       const keys = args[0]!.map()!.map((entry: xdr.ScMapEntry) => entry.key().sym().toString());
       expect(keys).toEqual(['alpha', 'zeta']);
+    });
+
+    it('applies per-field type hints to params map values', () => {
+      // A u64 stream ID passed through the params path must stay u64 — the
+      // #497 regression this fixes.
+      const args = operationToScVals({
+        params: { streamId: 1n, amount: 100 },
+        types: { streamId: 'u64', amount: 'i128' },
+      });
+
+      expect(args).toHaveLength(1);
+      const map = args[0]!.map()!;
+      const byKey = new Map(map.map(e => [e.key().sym().toString(), e.val()]));
+      expect(byKey.get('streamId')!.switch().name).toBe('scvU64');
+      expect(byKey.get('amount')!.switch().name).toBe('scvI128');
     });
 
     it('sends no arguments for an operation with empty params', () => {

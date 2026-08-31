@@ -114,7 +114,9 @@ describe('soroban.ts rate limit handling', () => {
     expect(mockGetTransaction).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(200);
-    await expect(promise).rejects.toThrow('Transaction timed out: abc123');
+    // After maxAttempts without a terminal status, invokeContract resolves the
+    // submitted hash as pending rather than throwing a misleading timeout (#509).
+    await expect(promise).resolves.toBe('abc123');
     expect(mockGetTransaction).toHaveBeenCalledTimes(2);
   });
 });

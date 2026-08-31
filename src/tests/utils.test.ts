@@ -517,6 +517,11 @@ describe('isValidAddress', () => {
     expect(isValidAddress(undefined as unknown as string)).toBe(false);
   });
 
+  it('returns true for a valid Soroban contract address (C...) (#512)', () => {
+    const contractId = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+    expect(isValidAddress(contractId)).toBe(true);
+  });
+
   it('returns false for a random unrelated string', () => {
     expect(isValidAddress('not-a-stellar-address')).toBe(false);
   });

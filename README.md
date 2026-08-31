@@ -164,7 +164,7 @@ The `StreamBuilder` class exposes the following chainable methods:
 
 ### Batching Streams
 
-You can bundle multiple stream operations together and compile them using `ConduitBatcher`. `execute()` alone only knows how to turn arbitrary objects into a generic map argument — to invoke the real `create_stream` contract, build each stream's `BatchOperation` with `toBatchOperation()` and submit through `executeAsync()`:
+You can bundle multiple stream operations together and compile them using `ConduitBatcher`. `execute()` turns each item into the ABI-exact positional `create_stream` args when the default method is used (amount/rate encoded as `i128`, `startTime`/`endTime` as `u64`), falling back to a generic sorted-map argument for other methods. To invoke the real `create_stream` contract with full control (including validated, defaulted `start_time`/`end_time`/`clawback_enabled`), build each stream's `BatchOperation` with `toBatchOperation()` and submit through `executeAsync()`:
 
 ```typescript
 import { StreamBuilder, ConduitBatcher } from '@conduit-protocol/sdk';
