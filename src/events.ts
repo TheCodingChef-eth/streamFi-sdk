@@ -244,6 +244,10 @@ export function dispatchEvent(
 
   const actor    = addressField(topics[1]);
   const sequence = topics[2] ? scValToU64(topics[2]) : undefined;
+  // Spread this into each decoded event so an absent sequence topic leaves
+  // the optional `sequence` field off entirely rather than set to
+  // `undefined` (which `exactOptionalPropertyTypes` rejects).
+  const seq: { sequence?: bigint } = sequence === undefined ? {} : { sequence };
 
   switch (topicName) {
     case TOPIC.WITHDRAWN: {
@@ -255,7 +259,7 @@ export function dispatchEvent(
         amount:         i128Field(fields, 0),
         totalWithdrawn: i128Field(fields, 1),
         remaining:      i128Field(fields, 2),
-        sequence,
+        ...seq,
       };
       handlers.onWithdraw(data);
       break;
@@ -269,7 +273,7 @@ export function dispatchEvent(
         sender:         actor,
         refundAmount:   i128Field(fields, 0),
         withdrawnSoFar: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onCancel(data);
       break;
@@ -283,7 +287,7 @@ export function dispatchEvent(
         sender:       actor,
         pausedAt:     u64Field(fields, 0),
         withdrawable: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onPause(data);
       break;
@@ -296,7 +300,7 @@ export function dispatchEvent(
       const data: ResumeEvent = {
         sender:    actor,
         resumedAt: Number(scValToU64(event.value)),
-        sequence,
+        ...seq,
       };
       handlers.onResume(data);
       break;
@@ -310,7 +314,7 @@ export function dispatchEvent(
         sender:     actor,
         amount:     i128Field(fields, 0),
         newBalance: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onTopUp(data);
       break;
@@ -322,7 +326,7 @@ export function dispatchEvent(
       const data: ClawbackEvent = {
         sender: actor,
         amount: scValToI128(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onClawback(data);
       break;
@@ -340,7 +344,7 @@ export function dispatchEvent(
         ratePerSecond:  i128Field(fields, 3),
         startTime:      u64Field(fields, 4),
         endTime:        u64Field(fields, 5),
-        sequence,
+        ...seq,
       };
       handlers.onCreated(data);
       break;
@@ -355,7 +359,7 @@ export function dispatchEvent(
         recipient:    actor,
         payoutAmount: i128Field(fields, 0),
         refundAmount: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onForceCancel(data);
       break;
@@ -367,7 +371,7 @@ export function dispatchEvent(
       const data: RecipientTransferEvent = {
         previousRecipient: actor,
         newRecipient:      addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onRecipientTransfer(data);
       break;
@@ -379,7 +383,7 @@ export function dispatchEvent(
       const data: OperatorSetEvent = {
         sender:   actor,
         operator: addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onOperatorSet(data);
       break;
@@ -391,7 +395,7 @@ export function dispatchEvent(
       const data: OperatorRevokedEvent = {
         sender:   actor,
         operator: addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onOperatorRevoke(data);
       break;

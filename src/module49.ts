@@ -73,8 +73,6 @@ export class Module49 {
 
     const elapsed = performance.now() - startTime;
     this.totalExecutionTimeMs += elapsed;
-    
-
 
     return results;
   }
@@ -86,12 +84,15 @@ export class Module49 {
     const nowSec = item.timestamp ?? Math.floor(Date.now() / 1000);
     const cacheKey = `${item.id}_${item.stream.withdrawn.toString()}_${item.stream.paused ? 1 : 0}_${item.stream.cancelled ? 1 : 0}_${item.stream.pausedAt}_${item.stream.ratePerSecond.toString()}_${item.stream.startTime}_${item.stream.endTime}_${nowSec}`;
 
+    // Every item that reaches here is processed, whether it is served from
+    // the cache or computed fresh below.
+    this.totalProcessed++;
+
     if (this.enableOptimization) {
       const cached = this.cache.get(cacheKey);
       if (cached) {
-  this.cacheHits++;
-  this.totalProcessed++;
-  return {
+        this.cacheHits++;
+        return {
           id: item.id,
           withdrawable: cached.withdrawable,
           progress: cached.progress,

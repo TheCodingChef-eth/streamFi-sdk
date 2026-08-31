@@ -149,7 +149,7 @@ export interface CreatedEvent {
   ratePerSecond: bigint;
   startTime: number;
   endTime: number;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /**
@@ -164,7 +164,7 @@ export interface ForceCancelEvent {
   payoutAmount: bigint;
   /** Unstreamed remainder refunded to the sender. */
   refundAmount: bigint;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when the recipient role is transferred to a new address (`xfer_rec` topic). */
@@ -172,7 +172,7 @@ export interface RecipientTransferEvent {
   /** The outgoing recipient who initiated the transfer (topics[1] actor). */
   previousRecipient: string;
   newRecipient: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when an operator is delegated on the stream (`set_op` topic). */
@@ -180,7 +180,7 @@ export interface OperatorSetEvent {
   /** The address that granted the operator role (topics[1] actor). */
   sender: string;
   operator: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when a previously-delegated operator is revoked (`rm_op` topic). */
@@ -188,7 +188,7 @@ export interface OperatorRevokedEvent {
   /** The address that revoked the operator role (topics[1] actor). */
   sender: string;
   operator: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** A gap detected in the per-contract event sequence — see `DataKey::EventSequence` in contracts/stream/src/events.rs. */
