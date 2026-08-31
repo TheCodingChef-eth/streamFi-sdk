@@ -428,6 +428,11 @@ export interface BatchSubmitOptions {
   sign?: (xdr: string) => Promise<string> | string;
   /** AbortSignal to cancel an in-progress submission. */
   signal?: AbortSignal;
+  /**
+   * Optional progress callback invoked each time a transaction reaches a
+   * terminal state (SUCCESS, FAILED, SKIPPED, or ERROR).
+   */
+  onProgress?: (progress: { index: number; method: string; status: BatchTxStatus }) => void;
 }
 
 const DEFAULT_SUBMIT_POLL_INTERVAL_MS = 1_000;
@@ -469,6 +474,17 @@ export async function submitBatch(
 
   const outcomes: BatchTxOutcome[] = [];
   let firstFailureIndex = -1;
+
+  function pushOutcome(outcome: BatchTxOutcome) {
+    outcomes.push(outcome);
+    if (options.onProgress) {
+      try {
+        options.onProgress({ index: outcome.index, method: outcome.method, status: outcome.status });
+      } catch (handlerErr) {
+        console.warn('[submitBatch] onProgress handler error:', handlerErr);
+      }
+    }
+  }
 
   for (const built of transactions) {
     // Once a failure is recorded, mark all subsequent txs as SKIPPED.
