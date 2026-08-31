@@ -17,6 +17,21 @@
       "require": "./dist/cjs/index.js",
       "types": "./dist/types/index.d.ts"
     },
+    "./indexer": {
+      "import": "./dist/esm/indexer.js",
+      "require": "./dist/cjs/indexer.js",
+      "types": "./dist/types/indexer.d.ts"
+    },
+    "./batch": {
+      "import": "./dist/esm/batch-tx.js",
+      "require": "./dist/cjs/batch-tx.js",
+      "types": "./dist/types/batch-tx.d.ts"
+    },
+    "./nonce": {
+      "import": "./dist/esm/nonce/NonceManager.js",
+      "require": "./dist/cjs/nonce/NonceManager.js",
+      "types": "./dist/types/nonce/NonceManager.d.ts"
+    },
     "./utils": {
       "import": "./dist/esm/utils.js",
       "require": "./dist/cjs/utils.js",
