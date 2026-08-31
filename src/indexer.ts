@@ -1,5 +1,5 @@
 import { ConduitError, UNKNOWN_CONTRACT_ERROR_CODE } from './errors.js';
-import { IndexerTimeoutError } from './errors.js';
+import { IndexerTimeoutError, OperationAbortedError } from './errors.js';
 
 export interface GraphQLQueryOptions {
   query: string;
@@ -160,7 +160,7 @@ export class GraphQLIndexer {
 
     // If the caller already aborted, fail fast without issuing the request.
     if (callerSignal?.aborted) {
-      throw new DOMException('The operation was aborted.', 'AbortError');
+      throw new OperationAbortedError('GraphQLIndexer.query');
     }
 
     const controller = new AbortController();
