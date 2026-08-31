@@ -1,5 +1,5 @@
 import type { StreamInfo } from './types/index.js';
-import { withdrawableLocal } from './utils.js';
+import { withdrawableLocal, streamProgress, normalizeProgress } from './utils.js';
 import { LruMemoCache } from './lru-memo-cache.js';
 
 export interface Module49Config {
@@ -102,17 +102,7 @@ export class Module49 {
     this.cacheMisses++;
     const withdrawable = withdrawableLocal(item.stream, nowSec);
 
-    let progress = 0;
-    const { startTime, endTime } = item.stream;
-    if (nowSec >= startTime) {
-      if (endTime === 0) {
-        progress = 0.5; // open-ended active
-      } else if (nowSec >= endTime) {
-        progress = 1.0;
-      } else {
-        progress = (nowSec - startTime) / (endTime - startTime);
-      }
-    }
+    const progress = normalizeProgress(streamProgress(item.stream, nowSec));
 
     const computedAt = nowSec;
 
