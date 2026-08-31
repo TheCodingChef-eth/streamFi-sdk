@@ -100,19 +100,12 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 
   const server = getServer(rpcUrl);
 
-  const ASYNC_METHODS = [
-    'getAccount',
-    'getEvents',
-    'simulateTransaction',
-    'getTransaction',
-    'getLatestLedger',
-    'getNetwork',
-  ];
+  const EXCLUDED_METHODS = ['constructor'];
 
   const proxied = new Proxy(server, {
     get(target, propKey, receiver) {
       const origMethod = Reflect.get(target, propKey, receiver) as unknown;
-      if (typeof origMethod === 'function' && typeof propKey === 'string' && ASYNC_METHODS.includes(propKey)) {
+      if (typeof origMethod === 'function' && typeof propKey === 'string' && !EXCLUDED_METHODS.includes(propKey)) {
         return async function (...args: unknown[]) {
           const MAX_RETRIES = 3;
           let delay = 500;
