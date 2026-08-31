@@ -49,7 +49,8 @@ describe('GraphQLIndexer Memory Leak & Real Network I/O Tests', () => {
       body: JSON.stringify({ query: queryStr, variables }),
       signal: expect.any(AbortSignal),
     });
-    expect(result).toEqual(mockResponseData);
+    // query() returns the unwrapped GraphQL `data` payload, not the envelope.
+    expect(result).toEqual(mockResponseData.data);
 
     indexer.cleanup();
   });
@@ -65,6 +66,28 @@ describe('GraphQLIndexer Memory Leak & Real Network I/O Tests', () => {
 
     await expect(indexer.query({ query: 'query { streams { id } }' })).rejects.toThrow(
       'GraphQL query failed with status 500: Internal Server Error'
+    );
+
+    indexer.cleanup();
+  });
+
+  it('throws when a GraphQL response contains query-level errors despite HTTP 200', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: null,
+        errors: [
+          { message: 'Cannot query field "doesNotExist" on type "Query".' },
+          { message: 'Resolver error: boom' },
+        ],
+      }),
+    } as Response);
+
+    const indexer = new GraphQLIndexer(endpoint);
+
+    await expect(indexer.query({ query: 'query { doesNotExist }' })).rejects.toThrow(
+      'Cannot query field "doesNotExist" on type "Query".'
     );
 
     indexer.cleanup();

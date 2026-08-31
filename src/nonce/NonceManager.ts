@@ -143,18 +143,29 @@ export class NonceManager {
       throw new Error('NonceManager has been destroyed');
     }
 
-    while (this.isLocked) {
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    const start = Date.now();
+    while (this.isLocked && Date.now() - start < 5000) {
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
     }
 
     this.currentNonce = nonce !== undefined ? this.toSafeBigInt(nonce) : 0n;
     this.acquiredNonces.clear();
+    
+    const resetError = new Error('NonceManager reset');
+    for (const entry of this.lockQueue) {
+      entry.reject(resetError);
+    }
     this.lockQueue = [];
     this.isLocked = false;
   }
 
   destroy(): void {
     this.isDestroyed = true;
+    
+    const destroyError = new Error('NonceManager destroyed');
+    for (const entry of this.lockQueue) {
+      entry.reject(destroyError);
+    }
     this.lockQueue = [];
     this.isLocked = false;
     this.acquiredNonces.clear();
@@ -184,8 +195,9 @@ export class NonceManager {
 
     const { promise, cancel } = this.enqueue();
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
+      timer = setTimeout(() => {
         cancel();
         reject(new Error(`NonceManager: acquire timed out after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -198,6 +210,8 @@ export class NonceManager {
         throw err;
       }
       throw new Error(String(err));
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -215,7 +229,7 @@ export class NonceManager {
    * exhausted.
    *
    * @param retries              number of patience windows
-   * @param delayMs              base backoff between windows (× attempt number)
+   * @param delayMs              base backoff between windows (× 2^attempt)
    * @param perAttemptTimeoutMs  how long each window waits before backing off
    */
   async safeAcquire(
@@ -273,7 +287,7 @@ export class NonceManager {
         // The single waiter is still queued (not cancelled) — just wait a
         // bit longer on the same slot.
         if (attempt < retries - 1) {
-          await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+          await new Promise((r) => setTimeout(r, delayMs * 2 ** attempt));
           if (handedLock) return handedLock;
         }
       }

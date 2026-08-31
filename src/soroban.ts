@@ -100,19 +100,12 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 
   const server = getServer(rpcUrl);
 
-  const ASYNC_METHODS = [
-    'getAccount',
-    'getEvents',
-    'simulateTransaction',
-    'getTransaction',
-    'getLatestLedger',
-    'getNetwork',
-  ];
+  const EXCLUDED_METHODS = ['constructor'];
 
   const proxied = new Proxy(server, {
     get(target, propKey, receiver) {
       const origMethod = Reflect.get(target, propKey, receiver) as unknown;
-      if (typeof origMethod === 'function' && typeof propKey === 'string' && ASYNC_METHODS.includes(propKey)) {
+      if (typeof origMethod === 'function' && typeof propKey === 'string' && !EXCLUDED_METHODS.includes(propKey)) {
         return async function (...args: unknown[]) {
           const MAX_RETRIES = 3;
           let delay = 500;
@@ -145,10 +138,32 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 }
 
 /**
+ * Resolve the inclusion (bid) fee, in stroops, for a submitted transaction.
+ *
+ * An explicit `fee` always wins. Otherwise `feeMultiplier` scales
+ * `BASE_FEE`. With neither set, this returns `BASE_FEE` (the network
+ * minimum) unchanged — the previous, always-hardcoded behaviour. `BASE_FEE`
+ * alone is not competitive under inclusion-fee pressure (surge pricing,
+ * congested ledgers): the bid goes unselected, `_sendAndPoll` exhausts its
+ * poll attempts, and the caller sees a misleading "Transaction timed out"
+ * instead of "fee too low" (see #509).
+ */
+export function resolveFee(config: { fee?: string; feeMultiplier?: number }): string {
+  if (config.fee !== undefined) return config.fee;
+  if (config.feeMultiplier !== undefined) {
+    return (BigInt(BASE_FEE) * BigInt(config.feeMultiplier)).toString();
+  }
+  return BASE_FEE;
+}
+
+/**
  * Build a contract-call transaction for simulate or submit.
  *
  * Fetches the caller's account from the RPC to get the current sequence
  * number, then wraps the call in a TransactionBuilder.
+ *
+ * @param fee - Inclusion fee in stroops. Defaults to `BASE_FEE`; pass the
+ * result of {@link resolveFee} to honour `ConduitConfig.fee`/`feeMultiplier`.
  */
 export async function buildContractCallTx(
   rpcUrl:      string,
@@ -157,6 +172,7 @@ export async function buildContractCallTx(
   contractId:  string,
   method:      string,
   args:        xdr.ScVal[],
+  fee:         string = BASE_FEE,
 ): Promise<ReturnType<TransactionBuilder['build']>> {
   const server  = createRpcServer(rpcUrl);
 
@@ -170,7 +186,7 @@ export async function buildContractCallTx(
   const contract = new Contract(contractId);
 
   return new TransactionBuilder(account, {
-    fee:            BASE_FEE,
+    fee,
     networkPassphrase: passphrase,
   })
     .addOperation(contract.call(method, ...args))
@@ -488,6 +504,14 @@ export async function queryXlmBalance(
  * 500 XLM fallback overstated the required balance by ~500 XLM (see #430).
  */
 export const DEFAULT_RESOURCE_FEE_ESTIMATE = 1_000_000n;
+
+/**
+ * Larger fallback used for expensive operations that deploy or instantiate
+ * contracts (e.g. `create_stream`). This is a conservative default sized in
+ * stroops (3 XLM) to avoid under-estimating required balance in the
+ * insufficient-balance error path when the simulation carries no fee fields.
+ */
+export const CREATE_RESOURCE_FEE_ESTIMATE = 30_000_000n;
 
 /**
  * Estimate the minimum resource fee required for a transaction simulation.

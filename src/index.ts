@@ -15,13 +15,18 @@ export {
 export type {
   BatchTransactionContext,
   BuiltBatchTransaction,
+  ScValType,
   BatchSubmitResult,
   BatchTxOutcome,
   BatchTxStatus,
   BatchSubmitOptions,
 } from './batch-tx.js';
 export { GraphQLIndexer, DEFAULT_INDEXER_TIMEOUT_MS } from './indexer.js';
-export type { GraphQLQueryOptions, GraphQLSubscriptionOptions, IndexerSubscription } from './indexer.js';
+export type {
+  GraphQLQueryOptions,
+  GraphQLSubscriptionOptions,
+  IndexerSubscription,
+} from './indexer.js';
 export { KeypairSigner } from './signer.js';
 export type { Signer } from './signer.js';
 export {
@@ -60,6 +65,7 @@ export {
   normalizeProgress,
   withdrawableLocal,
   bigintSafeStringify,
+  timeoutSignal,
 } from './utils.js';
 
 // RPC server lifecycle
@@ -103,4 +109,13 @@ export type {
   Module49Result,
   Module49Metrics,
 } from './module49.js';
+
+export { Module44 } from './module44.js';
+export type {
+  Module44Config,
+  StreamRiskItem,
+  LiquidityRiskLevel,
+  StreamRiskAssessment,
+  Module44Metrics,
+} from './module44.js';
 

@@ -145,13 +145,32 @@ export function validateContext(context: BatchTransactionContext): string[] {
 }
 
 /**
+ * ScVal type names accepted by {@link paramToScVal} (and per-field `types` on
+ * batch operations) to force a specific encoding instead of the default
+ * inference.
+ */
+export type ScValType =
+  | 'u32' | 'i32' | 'u64' | 'i64' | 'u128' | 'i128' | 'u256' | 'i256'
+  | 'string' | 'symbol' | 'address' | 'bool' | 'bytes';
+
+/**
  * Convert a single parameter to an ScVal.
  *
- * Strings that are valid Stellar addresses become `Address` values rather than
- * string values — passing a G- or C-address as a plain string is a common way
- * to build a transaction the contract then rejects.
+ * - Already-encoded `xdr.ScVal` values pass through untouched — their type is
+ *   already explicit, so re-encoding would destroy it.
+ * - An explicit `type` hint wins over every heuristic (see
+ *   {@link BatchOperation.types} for per-field hints in the params map).
+ * - Strings that are valid Stellar addresses become `Address` values rather
+ *   than string values — passing a G- or C-address as a plain string is a
+ *   common way to build a transaction the contract then rejects.
+ * - Everything else falls back to the SDK's natural encoding: positive
+ *   integers become `u64` and negatives `i64`. This is what the contract
+ *   expects for the u64-heavy ABI fields such as `create_stream`'s
+ *   `start_time`/`end_time` and stream IDs; previously every integer `number`
+ *   was forced to `i64` and every `bigint` to `i128`, producing the wrong
+ *   ScVal type and a contract-side type error (see #497).
  */
-export function paramToScVal(value: unknown): xdr.ScVal {
+export function paramToScVal(value: unknown, type?: ScValType): xdr.ScVal {
   // Values with no ScVal representation (symbols, functions, undefined) map to
   // void rather than throwing — validation has already accepted the payload, so
   // a stray non-serialisable field must not take the whole batch down.
@@ -165,15 +184,20 @@ export function paramToScVal(value: unknown): xdr.ScVal {
   if (value === null) {
     return xdr.ScVal.scvVoid();
   }
+  if (value instanceof xdr.ScVal) {
+    return value;
+  }
+
+  // An explicit type hint means the caller knows the contract ABI — trust it
+  // over any heuristic below (e.g. `{ streamId: 'u64' }`, `{ amount: 'i128' }`).
+  if (type !== undefined) {
+    return nativeToScVal(value, { type });
+  }
+
   if (typeof value === 'string' && (StrKey.isValidEd25519PublicKey(value) || StrKey.isValidContract(value))) {
     return new Address(value).toScVal();
   }
-  if (typeof value === 'bigint') {
-    return nativeToScVal(value, { type: 'i128' });
-  }
-  if (typeof value === 'number' && Number.isInteger(value)) {
-    return nativeToScVal(value, { type: 'i64' });
-  }
+
   return nativeToScVal(value);
 }
 
@@ -182,14 +206,18 @@ export function paramToScVal(value: unknown): xdr.ScVal {
  *
  * `args` wins when present, so a caller who knows the contract ABI controls the
  * positional arguments exactly. Otherwise `params` is passed as a single map
- * argument, keyed by field name.
+ * argument, keyed by field name, with `types` supplying per-field ScVal type
+ * information when the default inference would pick the wrong type (e.g. a
+ * u64 stream ID, which untyped would encode as a string after bigint
+ * serialisation, or an i128 amount).
  */
 export function operationToScVals(operation: {
   params?: Record<string, unknown> | undefined;
+  types?: Record<string, ScValType> | undefined;
   args?: unknown[] | undefined;
 }): xdr.ScVal[] {
   if (Array.isArray(operation.args)) {
-    return operation.args.map(paramToScVal);
+    return operation.args.map(arg => paramToScVal(arg));
   }
 
   const params = operation.params ?? {};
@@ -204,7 +232,7 @@ export function operationToScVals(operation: {
         .map(([key, value]) =>
           new xdr.ScMapEntry({
             key: nativeToScVal(key, { type: 'symbol' }),
-            val: paramToScVal(value),
+            val: paramToScVal(value, operation.types?.[key]),
           }),
         ),
     ),
@@ -214,6 +242,8 @@ export function operationToScVals(operation: {
 interface BuildableOperation {
   method: string;
   params?: Record<string, unknown> | undefined;
+  /** Per-field ScVal type hints for `params` map entries (see #497). */
+  types?: Record<string, ScValType> | undefined;
   args?: unknown[] | undefined;
 }
 

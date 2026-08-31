@@ -31,6 +31,7 @@ import { WalletConnectAdapter } from '../adapters/walletconnect.js';
 vi.mock('../soroban.js', () => ({
   buildContractCallTx: vi.fn().mockResolvedValue({ _stub: 'tx' }),
   simulateReadOnly:    vi.fn(),
+  resolveFee:  () => '100',
   scValToU64:  (v: { u64: () => { toString: () => string } }) => BigInt(v.u64().toString()),
   scValToI128: () => 0n,
   NETWORK_PASSPHRASE: {

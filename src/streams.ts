@@ -31,11 +31,13 @@ import {
   catchNetworkError,
   queryXlmBalance,
   estimateRequiredFee,
+  CREATE_RESOURCE_FEE_ESTIMATE,
   DEFAULT_RPC,
   NETWORK_PASSPHRASE,
   DEFAULT_CONFIRMATION_MAX_ATTEMPTS,
   DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
   createRpcServer,
+  resolveFee,
 } from './soroban.js';
 import {
   STREAM_FLAG_PAUSED,
@@ -51,22 +53,47 @@ import { ConduitError, RateLimitError, InsufficientBalanceError, StreamErrorCode
  * Tracks which v1-deprecated methods have already warned this session, so
  * repeated calls (e.g. in a hot loop) do not spam the console.
  */
+/** Default concurrency limit for bounded page-fetching (Issue #549). */
+const DEFAULT_LIST_CONCURRENCY = 8;
+
+/**
+ * Runs `fn` over `items` with at most `concurrency` in-flight calls.
+ * Preserves result ordering to match a naive `Promise.all` fan-out.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]!);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 const _warnedDeprecations = new Set<string>();
 
 /**
- * Logs a one-time console warning for a deprecated v1 method, but only in
- * development mode. Safe to call in browser bundles: guards `process` with
- * a `typeof` check since it is not guaranteed to exist outside Node/bundlers
- * that define it at build time.
+ * Logs a one-time console warning for a deprecated v1 method, suppressed
+ * only when the environment is *provably* production. Uses optional chaining
+ * so that when `process` is absent (e.g. a plain browser bundle without a
+ * bundler shim) the expression evaluates to `undefined !== 'production'`
+ * which is `true` — warnings are shown, not silently swallowed.
  *
  * @param methodName - The deprecated method, e.g. 'StreamsModule.create()'.
  * @param replacement - The suggested replacement, e.g. 'StreamBuilder'.
  */
 function warnV1Deprecated(methodName: string, replacement: string): void {
-  const isDev =
-    typeof process !== 'undefined' &&
-    typeof process.env !== 'undefined' &&
-    process.env.NODE_ENV !== 'production';
+  const isDev = process?.env?.NODE_ENV !== 'production';
   if (!isDev) return;
   if (_warnedDeprecations.has(methodName)) return;
   _warnedDeprecations.add(methodName);
@@ -82,6 +109,12 @@ export class StreamsModule {
   private readonly passphrase: string;
   private readonly _factory:   FactoryModule;
   private activeWallet?:       WalletAdapter;
+
+  /**
+   * Inclusion (bid) fee, in stroops, for transactions this module submits.
+   * Resolved once from `config.fee` / `config.feeMultiplier` (see #509).
+   */
+  private readonly _fee: string;
 
   /**
    * Session-scoped cache of stream ID → contract address resolutions.
@@ -111,6 +144,7 @@ export class StreamsModule {
     this.rpcUrl     = config.rpcUrl ?? DEFAULT_RPC[config.network];
     this.passphrase = NETWORK_PASSPHRASE[config.network];
     this._factory   = new FactoryModule(config);
+    this._fee       = resolveFee(config);
 
     if (config.wallet) {
       this.activeWallet = config.wallet;
@@ -136,6 +170,7 @@ export class StreamsModule {
    * Resolve the caller address, handling both sync and async getPublicKey().
    * Safe when the wallet adapter returns a promise — but it MUST only be
    * called from async contexts. Results are cached per wallet configuration
+   * once a valid public key is resolved (does not cache null/ZERO_ADDR #562)
    * and invalidated on setWallet().
    */
   private async _resolveCallerAddress(): Promise<string> {
@@ -145,7 +180,11 @@ export class StreamsModule {
     let addr: string;
     if (this.activeWallet) {
       const pk = await this.activeWallet.getPublicKey();
-      addr = pk ?? ZERO_ADDR;
+      if (pk && pk !== ZERO_ADDR) {
+        this._cachedCallerAddr = pk;
+        return pk;
+      }
+      return ZERO_ADDR;
     } else if (this.config.signer) {
       addr = this.config.signer.publicKey();
     } else if (this.config.keypair) {
@@ -153,7 +192,9 @@ export class StreamsModule {
     } else {
       addr = ZERO_ADDR;
     }
-    this._cachedCallerAddr = addr;
+    if (addr && addr !== ZERO_ADDR) {
+      this._cachedCallerAddr = addr;
+    }
     return addr;
   }
 
@@ -240,7 +281,7 @@ export class StreamsModule {
       boolToScVal(clawbackEnabled),
     ];
 
-    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, factoryId, 'create_stream', args);
+    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, factoryId, 'create_stream', args, this._fee);
     const server = this._server();
     const sim    = await catchNetworkError('simulateTransaction (create)', server.simulateTransaction(tx));
 
@@ -250,7 +291,7 @@ export class StreamsModule {
       // query the actual XLM balance and estimate the required fee.
       if (err instanceof InsufficientBalanceError && err.currentBalance === 0n && err.requiredBalance === 0n) {
         const xlmBalance = await queryXlmBalance(this.rpcUrl, this.passphrase, senderAddr).catch(() => 0n);
-        const requiredFee = estimateRequiredFee(sim);
+        const requiredFee = estimateRequiredFee(sim, CREATE_RESOURCE_FEE_ESTIMATE);
         const required = depositStroops + requiredFee;
         throw new InsufficientBalanceError(xlmBalance, required, sim.error);
       }
@@ -327,35 +368,45 @@ export class StreamsModule {
   }
 
   /**
-   * Withdraw from multiple streams concurrently.
+   * Withdraw from multiple streams.
    *
    * Note: Soroban currently permits only one invoke_host_function
    * operation per transaction, so this cannot be assembled into a single
    * atomic transaction the way classic Stellar payment operations can.
-   * Each withdrawal is submitted as its own transaction; they run
-   * concurrently and are reported independently so a failure on one
-   * streamId (e.g. StreamNotFound, insufficient balance) does not block
-   * or roll back the others.
+   * Each withdrawal is submitted as its own transaction; they are reported
+   * independently so a failure on one streamId (e.g. StreamNotFound,
+   * insufficient balance) does not block or fail the others.
+   *
+   * Withdrawals are submitted one at a time, not concurrently. Each
+   * withdraw() -> _invoke() -> buildContractCallTx() reads the caller
+   * account's current sequence number via getAccount() and builds a
+   * transaction on top of it. Firing all N withdrawals at once means every
+   * one of them reads the same sequence number and builds a transaction
+   * with the same value, so with a single keypair/wallet at most one
+   * submission can ever land — the rest fail with txBAD_SEQ (see #504).
+   * Awaiting each withdrawal (submit + confirm) before starting the next
+   * guarantees getAccount() only observes the sequence after the previous
+   * transaction has landed, so every submission gets a distinct, ordered
+   * sequence number.
    */
   async batchWithdraw(withdrawals: BatchWithdrawItem[]): Promise<BatchWithdrawResult[]> {
     this._ensureCanMutate();
 
-    const settled = await Promise.allSettled(
-      withdrawals.map(w => this.withdraw(w.streamId, w.amount)),
-    );
-
-    return settled.map((result, i) => {
-      const streamId = BigInt(withdrawals[i]!.streamId);
-      if (result.status === 'fulfilled') {
-        return { streamId, success: true, txHash: result.value };
+    const results: BatchWithdrawResult[] = [];
+    for (const w of withdrawals) {
+      const streamId = BigInt(w.streamId);
+      try {
+        const txHash = await this.withdraw(w.streamId, w.amount);
+        results.push({ streamId, success: true, txHash });
+      } catch (err) {
+        results.push({
+          streamId,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      const err = result.reason;
-      return {
-        streamId,
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    });
+    }
+    return results;
   }
 
   /** Cancel the stream (sender only). Settles all balances atomically. */
@@ -430,7 +481,7 @@ export class StreamsModule {
     this._ensureCanMutate();
     const addr   = await this._resolveAddr(BigInt(streamId));
     const caller = await this._getSenderAddress();
-    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, caller, addr, 'clawback', []);
+    const tx     = await buildContractCallTx(this.rpcUrl, this.passphrase, caller, addr, 'clawback', [], this._fee);
     const server = this._server();
     const sim    = await catchNetworkError('simulateTransaction (clawback)', server.simulateTransaction(tx));
 
@@ -595,8 +646,10 @@ export class StreamsModule {
       // call would serially resolve the address and then simulate — 2 serial
       // RPCs per stream. Pre-warming collapses the address lookups into a
       // single parallel fan-out before the info simulations begin.
-      await Promise.all(ids.map(id => this._resolveAddr(id)));
-      const streams = await Promise.all(ids.map(id => this.get(id)));
+      // Bounded concurrency (#549) avoids hammering the RPC endpoint with
+      // up to 100 simultaneous simulateTransaction requests.
+      await mapWithConcurrency(ids, DEFAULT_LIST_CONCURRENCY, (id) => this._resolveAddr(id));
+      const streams = await mapWithConcurrency(ids, DEFAULT_LIST_CONCURRENCY, (id) => this.get(id));
       const hasNextPage = hasNextPageOverride ?? ids.length === limit;
       const totalCount = BigInt(offset + ids.length);
       return {
@@ -655,6 +708,11 @@ export class StreamsModule {
     // otherwise a client built without an explicit rpcUrl passes `undefined`
     // to `createRpcServer`, which throws / never connects.
     return subscribeToStream(this.rpcUrl, address, handlers);
+  }
+
+  /** Clear the address cache. Useful for testing or manual memory management. */
+  clearAddressCache(): void {
+    this._factory.clearAddressCache();
   }
 
   /** Synchronous subscribe - resolves address lazily on first poll tick. */
@@ -746,15 +804,11 @@ export class StreamsModule {
   }
 
   private async _resolveAddr(id: bigint): Promise<string> {
-    // Return from the session cache to avoid a factory RPC on every operation
-    // for the same stream ID. Stream contract addresses are immutable once
-    // assigned by the factory, so the cache never needs invalidation.
-    const cached = this._addrCache.get(id);
-    if (cached) return cached;
-
+    // Use the factory's bounded LRU cache for address resolution.
+    // Stream contract addresses are immutable once assigned by the factory,
+    // so the cache never needs invalidation.
     const addr = await this._factory.streamAddress(id);
     if (!addr) throw new ConduitError('stream', StreamErrorCode.StreamNotFound, `Stream ${id} not found`);
-    this._addrCache.set(id, addr);
     return addr;
   }
 
@@ -771,7 +825,7 @@ export class StreamsModule {
   /** Simulate -> assemble -> sign -> submit -> poll. Returns txHash. */
   private async _invoke(contractId: string, method: string, args: xdr.ScVal[]): Promise<string> {
     const senderAddr = await this._getSenderAddress();
-    const tx         = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, contractId, method, args);
+    const tx         = await buildContractCallTx(this.rpcUrl, this.passphrase, senderAddr, contractId, method, args, this._fee);
     const server     = this._server();
     const sim        = await catchNetworkError('simulateTransaction (invoke)', server.simulateTransaction(tx));
     if (SorobanRpc.Api.isSimulationError(sim)) {

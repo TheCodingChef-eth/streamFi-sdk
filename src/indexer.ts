@@ -1,3 +1,4 @@
+import { ConduitError, UNKNOWN_CONTRACT_ERROR_CODE } from './errors.js';
 import { IndexerTimeoutError } from './errors.js';
 
 export interface GraphQLQueryOptions {
@@ -27,6 +28,10 @@ export interface GraphQLSubscriptionOptions {
   headers?: Record<string, string>;
   onData: (data: unknown) => void;
   onError?: (error: Error) => void;
+  /** Matches WebSocketRelayer: how many reconnects after an unexpected close. Default 5. */
+  maxReconnectAttempts?: number;
+  /** Base delay in ms; actual wait is delay * attempt number. Default 1000. */
+  reconnectDelayMs?: number;
 }
 
 export interface IndexerSubscription {
@@ -106,7 +111,26 @@ export class GraphQLIndexer {
       throw new Error(`GraphQL query failed with status ${response.status}: ${response.statusText}`);
     }
 
-    return (await response.json()) as unknown;
+    const body = (await response.json()) as {
+      data?: unknown;
+      errors?: unknown[];
+    };
+
+    if (Array.isArray(body?.errors) && body.errors.length > 0) {
+      const messages = body.errors
+        .map((error) => {
+          if (error && typeof error === 'object' && 'message' in error) {
+            const message = (error as { message?: unknown }).message;
+            return typeof message === 'string' && message.length > 0 ? message : JSON.stringify(error);
+          }
+          return String(error);
+        })
+        .filter((message) => message.length > 0);
+
+      throw new ConduitError('stream', UNKNOWN_CONTRACT_ERROR_CODE, messages.join('; '));
+    }
+
+    return body?.data;
   }
 
   /**
@@ -198,19 +222,48 @@ export class GraphQLIndexer {
       throw new Error('GraphQL query variables must be an object');
     }
 
+    const maxReconnectAttempts = this.parseBoundedInt(
+      options.maxReconnectAttempts,
+      5,
+      0,
+      32,
+      'maxReconnectAttempts',
+    );
+    const reconnectDelayMs = this.parseBoundedInt(
+      options.reconnectDelayMs,
+      1000,
+      0,
+      60_000,
+      'reconnectDelayMs',
+    );
+
     let unsubscribed = false;
     const subId = `sub_${++this.subCounter}_${Date.now()}`;
 
     let ws: WebSocket | null = null;
     let abortController: AbortController | null = null;
+    let reconnectAttempts = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearReconnectTimer = (): void => {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
 
     const subscription: IndexerSubscription = {
       unsubscribe: () => {
         if (unsubscribed) return;
         unsubscribed = true;
+        clearReconnectTimer();
 
         if (ws) {
           try {
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.onmessage = null;
+            ws.onopen = null;
             if (ws.readyState === 1 /* OPEN */) {
               ws.send(JSON.stringify({ id: subId, type: 'complete' }));
             }
@@ -236,76 +289,112 @@ export class GraphQLIndexer {
 
     this.activeSubscriptions.add(subscription);
 
-    const WebSocketCtor = this.getWebSocketCtor();
-    if (WebSocketCtor) {
+    const openSocket = (): void => {
+      if (unsubscribed || this.isDestroyed) return;
+      const WebSocketCtor = this.getWebSocketCtor();
+      if (!WebSocketCtor) return;
+
+      const wsUrl = this.getWsUrl(this.endpoint);
+      let socket: WebSocket;
       try {
-        const wsUrl = this.getWsUrl(this.endpoint);
-        let socket: WebSocket;
         try {
           socket = new WebSocketCtor(wsUrl, 'graphql-transport-ws');
         } catch {
           socket = new WebSocketCtor(wsUrl);
         }
-        ws = socket;
-
-        socket.onopen = () => {
-          if (unsubscribed || this.isDestroyed) {
-            subscription.unsubscribe();
-            return;
-          }
-          try {
-            socket.send(JSON.stringify({ type: 'connection_init' }));
-            socket.send(
-              JSON.stringify({
-                id: subId,
-                type: 'subscribe',
-                payload: {
-                  query: options.query,
-                  variables,
-                },
-              })
-            );
-          } catch (err) {
-            this.handleError(options.onError, err);
-          }
-        };
-
-        socket.onmessage = (event: MessageEvent) => {
-          if (unsubscribed || this.isDestroyed) return;
-          try {
-            const raw: unknown =
-              typeof event.data === 'string'
-                ? (JSON.parse(event.data) as unknown)
-                : (event.data as unknown);
-            if (!raw || typeof raw !== 'object') return;
-            const data = raw as GraphQLServerMessage;
-
-            if (data.type === 'next' || data.type === 'data') {
-              const payload = data.payload ?? data.data;
-              options.onData(payload);
-            } else if (data.type === 'error') {
-              const errPayload = data.payload ?? data.errors;
-              const errMsg = typeof errPayload === 'string' ? errPayload : JSON.stringify(errPayload);
-              this.handleError(options.onError, new Error(errMsg));
-            }
-          } catch (err) {
-            this.handleError(options.onError, err);
-          }
-        };
-
-        socket.onerror = (_event: Event) => {
-          if (unsubscribed || this.isDestroyed) return;
-          this.handleError(options.onError, new Error(`GraphQL subscription WebSocket error on ${this.endpoint}`));
-        };
-
-        socket.onclose = () => {
-          if (!unsubscribed && !this.isDestroyed) {
-            subscription.unsubscribe();
-          }
-        };
       } catch (err) {
         this.handleError(options.onError, err);
+        return;
       }
+      ws = socket;
+      let queuedSubscribeMessage: string | null = null;
+
+      socket.onopen = () => {
+        if (unsubscribed || this.isDestroyed) {
+          subscription.unsubscribe();
+          return;
+        }
+        reconnectAttempts = 0;
+        try {
+          socket.send(JSON.stringify({ type: 'connection_init' }));
+          queuedSubscribeMessage = JSON.stringify({
+            id: subId,
+            type: 'subscribe',
+            payload: {
+              query: options.query,
+              variables,
+            },
+          });
+        } catch (err) {
+          this.handleError(options.onError, err);
+        }
+      };
+
+      socket.onmessage = (event: MessageEvent) => {
+        if (unsubscribed || this.isDestroyed) return;
+        try {
+          const raw: unknown =
+            typeof event.data === 'string'
+              ? (JSON.parse(event.data) as unknown)
+              : (event.data as unknown);
+          if (!raw || typeof raw !== 'object') return;
+          const data = raw as GraphQLServerMessage;
+
+          if (data.type === 'connection_ack') {
+            if (queuedSubscribeMessage !== null) {
+              socket.send(queuedSubscribeMessage);
+              queuedSubscribeMessage = null;
+            }
+            return;
+          }
+
+          if (data.type === 'next' || data.type === 'data') {
+            const payload = data.payload ?? data.data;
+            options.onData(payload);
+          } else if (data.type === 'error') {
+            const errPayload = data.payload ?? data.errors;
+            const errMsg = typeof errPayload === 'string' ? errPayload : JSON.stringify(errPayload);
+            this.handleError(options.onError, new Error(errMsg));
+          }
+        } catch (err) {
+          this.handleError(options.onError, err);
+        }
+      };
+
+      socket.onerror = (_event: Event) => {
+        if (unsubscribed || this.isDestroyed) return;
+        this.handleError(options.onError, new Error(`GraphQL subscription WebSocket error on ${this.endpoint}`));
+      };
+
+      socket.onclose = () => {
+        if (unsubscribed || this.isDestroyed) return;
+        this.handleError(
+          options.onError,
+          new Error(`GraphQL subscription WebSocket closed on ${this.endpoint}`),
+        );
+        if (reconnectAttempts >= maxReconnectAttempts) {
+          this.handleError(
+            options.onError,
+            new Error(
+              `GraphQL subscription WebSocket closed on ${this.endpoint} after ${maxReconnectAttempts} reconnect attempts exhausted`,
+            ),
+          );
+          subscription.unsubscribe();
+          return;
+        }
+        reconnectAttempts += 1;
+        const delay = reconnectDelayMs * reconnectAttempts;
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (unsubscribed || this.isDestroyed) return;
+          openSocket();
+        }, delay);
+      };
+    };
+
+    const WebSocketCtor = this.getWebSocketCtor();
+    if (WebSocketCtor) {
+      openSocket();
     } else {
       const fetchFn = typeof fetch !== 'undefined' ? fetch : (globalThis as unknown as { fetch?: typeof fetch }).fetch;
       if (typeof fetchFn === 'function' && typeof AbortController !== 'undefined') {
@@ -400,6 +489,22 @@ export class GraphQLIndexer {
       return 'ws://' + endpoint.slice(7);
     }
     return endpoint;
+  }
+
+  private parseBoundedInt(
+    value: unknown,
+    fallback: number,
+    min: number,
+    max: number,
+    name: string,
+  ): number {
+    if (value === undefined) {
+      return fallback;
+    }
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+      throw new Error(`GraphQL subscription ${name} must be an integer between ${min} and ${max}`);
+    }
+    return value;
   }
 
   private handleError(onError: ((err: Error) => void) | undefined, err: unknown): void {

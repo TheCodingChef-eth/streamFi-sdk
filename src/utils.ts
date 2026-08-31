@@ -200,3 +200,28 @@ export function isValidAddress(address: string): boolean {
   }
   return StrKey.isValidEd25519PublicKey(address) || StrKey.isValidContract(address);
 }
+
+/**
+ * A portable `AbortSignal` that aborts after `ms` milliseconds — pass it as
+ * the `signal` option to any SDK method that accepts one, e.g.
+ *
+ *     await client.streams.withdrawable(id, { signal: timeoutSignal(5_000) });
+ *
+ * Uses the native `AbortSignal.timeout()` when the runtime provides it
+ * (Node >= 17.3 / Deno >= 1.20 / Chrome 103 / Firefox 100 / Safari 15.4) and
+ * otherwise falls back to an `AbortController` + `setTimeout`, with `unref()`
+ * on Node so a pending timeout does not keep the process alive.
+ */
+export function timeoutSignal(ms: number): AbortSignal {
+  const AS = AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal };
+  if (typeof AS.timeout === 'function') {
+    return AS.timeout(ms);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+    ms,
+  );
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return controller.signal;
+}

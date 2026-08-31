@@ -300,6 +300,20 @@ describe('#136 — normalisation of hostile indexer payloads', () => {
     expect(result).toHaveLength(1);
   });
 
+  it('synthesizes composite keys when id and hash are absent to prevent false dedup', () => {
+    const events = [
+      { streamId: '5', kind: 'PAUSE', timestamp: 1000 },
+      { streamId: '5', kind: 'RESUME', timestamp: 2000 },
+      { streamId: '5', kind: 'WITHDRAW', timestamp: 3000 },
+    ];
+    const result = normalizeTransactions(events);
+    expect(result).toHaveLength(3);
+    // Timestamps are converted to milliseconds (asTimestamp multiplies by 1000)
+    expect(result[0]?.id).toBe('5:PAUSE:1000000');
+    expect(result[1]?.id).toBe('5:RESUME:2000000');
+    expect(result[2]?.id).toBe('5:WITHDRAW:3000000');
+  });
+
   it('fills defaults for every missing field', () => {
     const record = normalizeTransaction({ id: 'bare' });
     expect(record).not.toBeNull();

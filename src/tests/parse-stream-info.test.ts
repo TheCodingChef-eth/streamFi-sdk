@@ -69,6 +69,18 @@ function u64Scv(n: bigint): xdr.ScVal {
   return xdr.ScVal.scvU64(xdr.Uint64.fromString(n.toString()));
 }
 
+function u32Scv(n: number): xdr.ScVal {
+  return xdr.ScVal.scvU32(n);
+}
+
+// Bit-flags packed into the on-chain `StreamInfo::flags: u32`
+// (contracts/stream/src/storage.rs). `paused` / `cancelled` /
+// `clawbackEnabled` are NOT standalone struct fields — parseStreamInfo
+// derives them by masking `flags`.
+const FLAG_PAUSED           = 1;
+const FLAG_CLAWBACK_ENABLED = 1 << 1;
+const FLAG_CANCELLED        = 1 << 2;
+
 function i128Scv(n: bigint): xdr.ScVal {
   const lo = n & 0xffffffffffffffffn;
   const hi = n >> 64n;
@@ -94,10 +106,8 @@ function baseStreamMap(extra: Record<string, xdr.ScVal> = {}): xdr.ScVal {
     start_time:       u64Scv(1_000_000n),
     end_time:         u64Scv(1_004_000n),
     withdrawn:        i128Scv(0n),
-    paused:           xdr.ScVal.scvBool(false),
+    flags:            u32Scv(0),
     paused_at:        u64Scv(0n),
-    cancelled:        xdr.ScVal.scvBool(false),
-    clawback_enabled: xdr.ScVal.scvBool(false),
     ...extra,
   });
 }
@@ -109,9 +119,9 @@ beforeEach(() => {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe('parseStreamInfo — paused flag (#521)', () => {
-  it('sets paused=false when contract returns scvBool(false)', async () => {
-    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ paused: xdr.ScVal.scvBool(false) })));
+describe('parseStreamInfo — flags (#521)', () => {
+  it('sets paused=false when the paused bit is clear', async () => {
+    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ flags: u32Scv(0) })));
     const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule({ network: 'testnet', factoryAddress: FACTORY_ADDR, keypair: Keypair.random() });
 
@@ -119,10 +129,10 @@ describe('parseStreamInfo — paused flag (#521)', () => {
     expect(info.paused).toBe(false);
   });
 
-  it('sets paused=true when contract returns scvBool(true) (#521)', async () => {
+  it('sets paused=true when the paused bit is set (#521)', async () => {
     const pausedAt = 1_002_000n;
     mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({
-      paused:    xdr.ScVal.scvBool(true),
+      flags:     u32Scv(FLAG_PAUSED),
       paused_at: u64Scv(pausedAt),
     })));
     const { StreamsModule } = await import('../streams.js');
@@ -133,9 +143,8 @@ describe('parseStreamInfo — paused flag (#521)', () => {
     expect(info.pausedAt).toBe(Number(pausedAt));
   });
 
-  it('defaults paused=false when key is absent from map', async () => {
-    // Build a map without the 'paused' key at all
-    const { paused: _omit, ...rest } = {
+  it('defaults paused=false when the flags key is absent from the map', async () => {
+    const { flags: _omit, ...rest } = {
       sender:           new Address(SENDER).toScVal(),
       recipient:        new Address(RECIPIENT).toScVal(),
       token:            new Address(TOKEN_ADDR).toScVal(),
@@ -143,10 +152,8 @@ describe('parseStreamInfo — paused flag (#521)', () => {
       start_time:       u64Scv(1_000_000n),
       end_time:         u64Scv(1_004_000n),
       withdrawn:        i128Scv(0n),
-      paused:           xdr.ScVal.scvBool(false), // will be omitted
+      flags:            u32Scv(0), // will be omitted
       paused_at:        u64Scv(0n),
-      cancelled:        xdr.ScVal.scvBool(false),
-      clawback_enabled: xdr.ScVal.scvBool(false),
     };
     mockSimulate.mockResolvedValue(simSuccess(scvMap(rest)));
     const { StreamsModule } = await import('../streams.js');
@@ -156,8 +163,8 @@ describe('parseStreamInfo — paused flag (#521)', () => {
     expect(info.paused).toBe(false);
   });
 
-  it('sets cancelled=true when contract returns scvBool(true)', async () => {
-    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ cancelled: xdr.ScVal.scvBool(true) })));
+  it('sets cancelled=true when the cancelled bit is set', async () => {
+    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ flags: u32Scv(FLAG_CANCELLED) })));
     const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule({ network: 'testnet', factoryAddress: FACTORY_ADDR, keypair: Keypair.random() });
 
@@ -165,12 +172,25 @@ describe('parseStreamInfo — paused flag (#521)', () => {
     expect(info.cancelled).toBe(true);
   });
 
-  it('sets clawbackEnabled=true when contract returns scvBool(true)', async () => {
-    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ clawback_enabled: xdr.ScVal.scvBool(true) })));
+  it('sets clawbackEnabled=true when the clawback bit is set', async () => {
+    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({ flags: u32Scv(FLAG_CLAWBACK_ENABLED) })));
     const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule({ network: 'testnet', factoryAddress: FACTORY_ADDR, keypair: Keypair.random() });
 
     const info = await sdk.get(1n);
     expect(info.clawbackEnabled).toBe(true);
+  });
+
+  it('derives multiple flags from a combined bitmask', async () => {
+    mockSimulate.mockResolvedValue(simSuccess(baseStreamMap({
+      flags: u32Scv(FLAG_PAUSED | FLAG_CLAWBACK_ENABLED),
+    })));
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule({ network: 'testnet', factoryAddress: FACTORY_ADDR, keypair: Keypair.random() });
+
+    const info = await sdk.get(1n);
+    expect(info.paused).toBe(true);
+    expect(info.clawbackEnabled).toBe(true);
+    expect(info.cancelled).toBe(false);
   });
 });

@@ -90,7 +90,7 @@ describe('#570 — FactoryModule resolves the caller from a configured wallet ad
     await new FactoryModule(cfg({ wallet })).streamCount();
 
     expect(wallet.getPublicKey).toHaveBeenCalled();
-    expect(mockBuildTx.mock.calls[0][2]).toBe(WALLET_ADDR);
+    expect(mockBuildTx.mock.calls[0]![2]).toBe(WALLET_ADDR);
   });
 
   it('re-resolves after setWallet()', async () => {
@@ -102,8 +102,8 @@ describe('#570 — FactoryModule resolves the caller from a configured wallet ad
     factory.setWallet(stubWallet(WALLET2_ADDR));
     await factory.streamCount();
 
-    expect(mockBuildTx.mock.calls[0][2]).toBe(WALLET_ADDR);
-    expect(mockBuildTx.mock.calls[1][2]).toBe(WALLET2_ADDR);
+    expect(mockBuildTx.mock.calls[0]![2]).toBe(WALLET_ADDR);
+    expect(mockBuildTx.mock.calls[1]![2]).toBe(WALLET2_ADDR);
   });
 
   it('falls back to ZERO_ADDR when nothing is configured (unchanged behaviour)', async () => {
@@ -113,7 +113,7 @@ describe('#570 — FactoryModule resolves the caller from a configured wallet ad
 
     await new FactoryModule(cfg()).streamCount();
 
-    expect(mockBuildTx.mock.calls[0][2]).toBe(ZERO_ADDR);
+    expect(mockBuildTx.mock.calls[0]![2]).toBe(ZERO_ADDR);
   });
 });
 

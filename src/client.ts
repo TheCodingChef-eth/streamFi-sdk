@@ -1,4 +1,4 @@
-import type { ConduitConfig } from './types/index.js';
+import type { ConduitConfig, CreateStreamParams, CreateStreamResult, ListStreamsParams, PaginatedStreams, StreamEventHandlers, StreamInfo, Subscription, FeeEstimate, StreamOperation } from './types/index.js';
 import type { WalletAdapter } from './adapters/types.js';
 import { DEFAULT_RPC }               from './soroban.js';
 import { StreamsModule }             from './streams.js';
@@ -148,6 +148,77 @@ export class ConduitClient {
     return this.streams.resume(streamId);
   }
 
+  // ── Stream operation hoists (fixes #540) ─────────────────────────────────────
+  //
+  // Every public StreamsModule method is hoisted to the top level so the API
+  // surface is consistent — a caller who finds client.pauseStream() can
+  // reasonably expect client.create(), client.withdraw(), etc. to exist too.
+
+  /** Create a new payment stream (sender only). */
+  async createStream(params: CreateStreamParams): Promise<CreateStreamResult> {
+    return this.streams.create(params);
+  }
+
+  /** Get stream details by ID. */
+  async getStream(streamId: string): Promise<StreamInfo> {
+    return this.streams.get(streamId);
+  }
+
+  /** List streams with optional filtering. */
+  async listStreams(params?: ListStreamsParams): Promise<PaginatedStreams> {
+    return this.streams.list(params ?? {});
+  }
+
+  /** Get the withdrawable amount for a stream. */
+  async withdrawable(streamId: string): Promise<bigint> {
+    return this.streams.withdrawable(streamId);
+  }
+
+  /** Withdraw available tokens from a stream (recipient only). */
+  async withdraw(streamId: string): Promise<string> {
+    return this.streams.withdraw(streamId);
+  }
+
+  /** Cancel a stream (sender only). */
+  async cancelStream(streamId: string): Promise<string> {
+    return this.streams.cancel(streamId);
+  }
+
+  /** Top up a stream's deposit (sender only). */
+  async topUp(streamId: string, amount: bigint): Promise<string> {
+    return this.streams.topUp(streamId, amount);
+  }
+
+  /** Claw back unstreamed tokens (sender only, if clawback is enabled). */
+  async clawback(streamId: string): Promise<bigint> {
+    return this.streams.clawback(streamId);
+  }
+
+  /** Force-cancel a stream paused beyond the threshold (recipient only). */
+  async forceCancel(streamId: string): Promise<string> {
+    return this.streams.forceCancel(streamId);
+  }
+
+  /** Transfer the recipient role to a new address (recipient only). */
+  async transferRecipient(streamId: string, newRecipient: string): Promise<string> {
+    return this.streams.transferRecipient(streamId, newRecipient);
+  }
+
+  /** Get the cumulative amount streamed since start (regardless of withdrawals). */
+  async streamedTotal(streamId: string): Promise<bigint> {
+    return this.streams.streamedTotal(streamId);
+  }
+
+  /** Estimate the network fee for a stream operation. */
+  async estimateFee(operation: StreamOperation): Promise<FeeEstimate> {
+    return this.streams.estimateFee(operation);
+  }
+
+  /** Subscribe to on-chain events for a stream. */
+  subscribe(streamAddress: string, handlers: StreamEventHandlers): Subscription {
+    return this.streams.subscribe(streamAddress, handlers);
+  }
+
   /**
    * Dynamically attach or change the active wallet adapter.
    *
@@ -173,6 +244,15 @@ export class ConduitClient {
     assertWalletNetworkMatch(wallet, this.config.network);
     this.config.wallet = wallet;
     this.streams.setWallet(wallet);
+  }
+
+  /**
+   * Clear the address cache. Useful for testing or manual memory management.
+   * The cache stores stream ID → contract address mappings and is bounded LRU,
+   * but can be manually cleared if needed.
+   */
+  clearAddressCache(): void {
+    this.streams.clearAddressCache();
   }
 }
 

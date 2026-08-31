@@ -20,32 +20,44 @@ npm install @conduit-protocol/sdk
 
 ## Quickstart
 
+A complete, copy-pasteable create -> withdraw script on **testnet**. A runnable
+version lives at [`examples/quickstart.ts`](examples/quickstart.ts).
+
 ```typescript
 import { ConduitClient, fromStroops } from '@conduit-protocol/sdk';
 import { Keypair } from '@stellar/stellar-sdk';
 
+// Generate a testnet key and fund it once:
+//   const kp = Keypair.random();
+//   await fetch(`https://friendbot.stellar.org?addr=${kp.publicKey()}`);
+const keypair = Keypair.fromSecret(process.env.STELLAR_SECRET!);
+
 const client = new ConduitClient({
-  network:  'testnet',
-  keypair:  Keypair.fromSecret('S...'),
+  network:        'testnet',
+  keypair,
+  factoryAddress: process.env.FACTORY_ADDRESS!,   // testnet DripFactory contract id
 });
 
-// Create a 30-day USDC stream
-const { streamId } = await client.streams.create({
-  recipient:       'GABC...XYZ',
-  token:           'USDC',
-  depositAmount:   '1000',              // 1 000 USDC
-  durationSeconds: 30 * 24 * 3600,     // 30 days
-});
+async function main() {
+  // Stream 100 XLM to the recipient over one hour (the 1-hour minimum).
+  const { streamId, txHash } = await client.streams.create({
+    recipient:       keypair.publicKey(),   // self, for a runnable demo
+    token:           'native',              // XLM
+    depositAmount:   '100',
+    durationSeconds: 60 * 60,
+  });
+  console.log('stream', streamId, 'created  (tx', txHash + ')');
 
-console.log('Stream created:', streamId);
-// Recipient earns ≈ 0.000386 USDC / second
+  // Let value accrue, then withdraw the full available balance as the recipient.
+  await new Promise((r) => setTimeout(r, 15_000));
+  const available = await client.streams.withdrawable(streamId);
+  console.log('withdrawable:', fromStroops(available), 'XLM');
 
-// Check withdrawable balance (in stroops — the token's smallest unit)
-const available = await client.streams.withdrawable(streamId);
-console.log('Available:', fromStroops(available), 'USDC');
+  const withdrawTx = await client.streams.withdraw(streamId, available);
+  console.log('withdrawn  (tx', withdrawTx + ')');
+}
 
-// Withdraw
-await client.streams.withdraw(streamId, available);
+main().catch(console.error);
 ```
 
 ---
@@ -164,7 +176,7 @@ The `StreamBuilder` class exposes the following chainable methods:
 
 ### Batching Streams
 
-You can bundle multiple stream operations together and compile them using `ConduitBatcher`. `execute()` alone only knows how to turn arbitrary objects into a generic map argument — to invoke the real `create_stream` contract, build each stream's `BatchOperation` with `toBatchOperation()` and submit through `executeAsync()`:
+You can bundle multiple stream operations together and compile them using `ConduitBatcher`. `execute()` turns each item into the ABI-exact positional `create_stream` args when the default method is used (amount/rate encoded as `i128`, `startTime`/`endTime` as `u64`), falling back to a generic sorted-map argument for other methods. To invoke the real `create_stream` contract with full control (including validated, defaulted `start_time`/`end_time`/`clawback_enabled`), build each stream's `BatchOperation` with `toBatchOperation()` and submit through `executeAsync()`:
 
 ```typescript
 import { StreamBuilder, ConduitBatcher } from '@conduit-protocol/sdk';
@@ -542,6 +554,32 @@ calculateRate('1000', 2592000) // → 38580n  (stroops/sec)
 
 // Current progress (0–1) of a stream
 streamProgress(stream)         // → 0.42
+```
+
+### `AbortSignal` & timeouts
+
+Methods that do network I/O (`GraphQLIndexer.query`, batch/builder submission,
+...) accept an optional `signal: AbortSignal`. To bound one by time, pass
+`AbortSignal.timeout(ms)` — but note it needs **Node >= 17.3**, Deno >= 1.20,
+Chrome >= 103, Firefox >= 100, or Safari >= 15.4.
+
+For older runtimes use the SDK's `timeoutSignal(ms)` helper (native when
+available, `AbortController` + `setTimeout` otherwise):
+
+```typescript
+import { timeoutSignal } from '@conduit-protocol/sdk';
+
+const data = await indexer.query({ query: GET_STREAMS, signal: timeoutSignal(5_000) });
+```
+
+Or hand-roll the polyfill:
+
+```typescript
+function timeoutSignal(ms: number): AbortSignal {
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
 ```
 
 ---

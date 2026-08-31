@@ -325,14 +325,15 @@ export function normalizeTransaction(
 
   const record = raw as Record<string, unknown>;
 
-  const id = asString(record['id'] ?? record['hash'] ?? record['streamId']);
+  const id = asString(record['id'] ?? record['hash']);
   const hash = asString(record['hash'] ?? record['txHash'] ?? record['id']);
+  const streamId = asString(record['streamId'] ?? record['stream_id']);
 
   // A record with no identity at all is unusable — drop it rather than
   // rendering a row with an empty React key.
-  if (id === '' && hash === '') return null;
+  if (id === '' && hash === '' && streamId === '') return null;
 
-  const amountRaw = record['amount'] ?? record['value'] ?? record['ratePerSecond'];
+  const amountRaw = record['amount'] ?? record['value'];
   const kind = asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN');
   const explicitDirection = asEnum(
     record['direction'],
@@ -340,8 +341,14 @@ export function normalizeTransaction(
     'UNKNOWN',
   );
 
+  const timestamp = asTimestamp(record['timestamp'] ?? record['createdAt']);
+  // When neither id nor hash is present, synthesise a composite key so
+  // distinct events on the same stream aren't treated as duplicates.
+  const synthesizedId =
+    id !== '' ? id : hash !== '' ? hash : `${streamId}:${kind}:${timestamp}`;
+
   return {
-    id: id === '' ? hash : id,
+    id: synthesizedId,
     hash,
     streamId: asString(record['streamId'] ?? record['stream_id']),
     kind,
@@ -355,7 +362,7 @@ export function normalizeTransaction(
     counterparty: asString(
       record['counterparty'] ?? record['recipient'] ?? record['sender'],
     ),
-    timestamp: asTimestamp(record['timestamp'] ?? record['createdAt']),
+    timestamp,
   };
 }
 
@@ -742,14 +749,19 @@ export function formatAmount(amount: unknown, decimals = 7): string {
   const digits = negative ? raw.slice(1) : raw;
   if (digits === '') return '0';
 
-  const places = Math.max(0, Math.trunc(decimals));
+  const places = Number.isFinite(decimals) ? Math.max(0, Math.trunc(decimals)) : 7;
   const padded = digits.padStart(places + 1, '0');
-  const whole = padded.slice(0, padded.length - places) || '0';
+  // Strip leading zeros from the integer part (keep one) so a long all-zero
+  // input like '00000000000' does not group into '0,000' (#618).
+  const whole = (padded.slice(0, padded.length - places) || '0').replace(/^0+(?=\d)/, '');
   const fraction = places === 0 ? '' : padded.slice(padded.length - places);
   const trimmedFraction = fraction.replace(/0+$/, '');
 
   const formattedWhole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const sign = negative ? '-' : '';
+  // Never emit a signed zero ("-0"): a negative stroop value that scales to
+  // nothing is just zero (#618).
+  const isZero = formattedWhole === '0' && trimmedFraction === '';
+  const sign = negative && !isZero ? '-' : '';
 
   return trimmedFraction === ''
     ? `${sign}${formattedWhole}`

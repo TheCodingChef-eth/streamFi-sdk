@@ -4,9 +4,10 @@ import { boolToScVal } from './soroban.js';
 import {
   buildBatchTransactions,
   buildBatchTransactionsSync,
+  paramToScVal,
   validateContext,
 } from './batch-tx.js';
-import type { BatchTransactionContext, BuiltBatchTransaction } from './batch-tx.js';
+import type { BatchTransactionContext, BuiltBatchTransaction, ScValType } from './batch-tx.js';
 
 export interface SubmitOptions {
   maxRetries?: number;
@@ -440,6 +441,13 @@ export interface BatchOperation {
    * single map argument.
    */
   args?: unknown[];
+  /**
+   * Per-field ScVal type hints for the `params` map, keyed by field name
+   * (e.g. `{ streamId: 'u64' }` for a u64 stream ID, `{ amount: 'i128' }`
+   * for an i128 amount). Without a hint the default inference applies —
+   * positive integers encode as `u64`, negatives as `i64` (see #497).
+   */
+  types?: Record<string, ScValType>;
 }
 
 export interface BatchExecuteOptions {
@@ -657,15 +665,21 @@ export class ConduitBatcher {
     const method = options.method ?? 'create_stream';
     const operations = sanitized.map(params => {
       if (method === 'create_stream') {
+        // ABI-exact create_stream args: (sender, recipient, token,
+        // deposit_amount: i128, rate_per_sec: i128, start_time: u64,
+        // end_time: u64, clawback_enabled: bool). Previously these raw values
+        // were run through paramToScVal's blanket i64/i128 encoding, so
+        // start_time/end_time arrived as i64 and amounts as the wrong width;
+        // each arg is now typed explicitly (see #497).
         const args = [
-          params.sender,
-          params.recipient,
-          params.token,
-          params.amount,
-          params.ratePerSecond,
-          0, // start_time
-          0, // end_time
-          false, // clawback
+          paramToScVal(params.sender),
+          paramToScVal(params.recipient),
+          paramToScVal(params.token),
+          paramToScVal(params.amount, 'i128'),
+          paramToScVal(params.ratePerSecond, 'i128'),
+          paramToScVal(params.startTime ?? 0, 'u64'),
+          paramToScVal(params.endTime ?? 0, 'u64'),
+          boolToScVal(params.clawbackEnabled === true),
         ];
         return { method, args };
       }
