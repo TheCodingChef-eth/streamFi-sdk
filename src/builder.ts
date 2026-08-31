@@ -7,6 +7,7 @@ import {
   paramToScVal,
   validateContext,
 } from './batch-tx.js';
+import { OperationAbortedError } from './errors.js';
 import type { BatchTransactionContext, BuiltBatchTransaction, ScValType } from './batch-tx.js';
 
 export interface SubmitOptions {
@@ -312,7 +313,7 @@ export class StreamBuilder {
 
     const { signal } = options;
     if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
+      throw new OperationAbortedError('submit');
     }
 
     // Backpressure: reject if queue is full
@@ -340,7 +341,7 @@ export class StreamBuilder {
         }
 
         if (signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+          throw new OperationAbortedError('submit');
         }
 
         try {
@@ -352,7 +353,7 @@ export class StreamBuilder {
           return result;
         } catch (err) {
           if (signal?.aborted) {
-            throw new DOMException('Aborted', 'AbortError');
+            throw new OperationAbortedError('submit');
           }
           lastError = err;
           attempt++;
@@ -371,7 +372,7 @@ export class StreamBuilder {
                   clearTimeout(timer);
                   this.activeTimers.delete(timer);
                   signal.removeEventListener('abort', onAbort);
-                  reject(new DOMException('Aborted', 'AbortError'));
+                  reject(new OperationAbortedError('submit'));
                 };
                 signal.addEventListener('abort', onAbort, { once: true });
               }
