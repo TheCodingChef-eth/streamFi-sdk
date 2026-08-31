@@ -305,7 +305,7 @@ export class WebSocketRelayer {
       this.reconnectAttempts++;
       this.emitStateChange('reconnecting');
       await new Promise((r) => setTimeout(r, this.reconnectDelayMs * this.reconnectAttempts));
-      if (this.isDestroyed) return;
+      if (this.isDestroyed || !this.reconnectEnabled) return;
 
       await this.establishConnection();
     } catch {
