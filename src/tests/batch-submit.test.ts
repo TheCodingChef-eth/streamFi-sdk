@@ -21,6 +21,13 @@ vi.mock('@stellar/stellar-sdk', async () => {
   const actual = await vi.importActual('@stellar/stellar-sdk');
   return {
     ...actual,
+    // submitBatch wraps each stub XDR in `new Transaction(xdr, passphrase)`
+    // before handing it to the mocked server; the fixtures use placeholder
+    // strings ("XDR_0", ...) that the real parser would reject, so stub the
+    // constructor to a transparent carrier.
+    Transaction: vi.fn().mockImplementation(function MockTransaction(xdr: string) {
+      return { _xdr: xdr, toXDR: () => xdr };
+    }),
     SorobanRpc: {
       ...(actual as any).SorobanRpc,
       Server: vi.fn().mockImplementation(function MockServer() {
@@ -51,8 +58,6 @@ function makeTx(index: number, method = 'op'): BuiltBatchTransaction {
   return { index, method, xdr: `XDR_${index}`, prepared: true };
 }
 
-const SEND_OK   = { status: 'PENDING', hash: 'HASH' };
-const STATUS_OK = { status: SorobanRpc.Api.GetTransactionStatus.SUCCESS };
 const STATUS_FAILED = { status: SorobanRpc.Api.GetTransactionStatus.FAILED };
 
 // sendTransaction returns the hash suffixed by index so tests can distinguish
@@ -98,11 +103,6 @@ describe('submitBatch — argument validation', () => {
 
 describe('submitBatch — successful batch', () => {
   it('submits all transactions in order and reports SUCCESS for each', async () => {
-    mockSendTransaction.mockImplementation(async (tx: any) => {
-      // extract the index from the stub XDR_N so we can tie hash back to it
-      const idx = String(tx).includes('XDR_') ? 0 : 0;
-      return SEND_OK;
-    });
     mockSendTransaction
       .mockResolvedValueOnce(sendOk(0))
       .mockResolvedValueOnce(sendOk(1))

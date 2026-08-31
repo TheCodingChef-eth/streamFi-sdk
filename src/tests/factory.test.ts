@@ -154,7 +154,7 @@ describe('FactoryModule — streamAddress()', () => {
     expect(mockSimulate).toHaveBeenCalledTimes(1);
   });
 
-  it('does not cache a not-found (void) result, so a later resolution still hits the network', async () => {
+  it('caches a not-found (void) result only briefly, then re-resolves after clearAddressCache()', async () => {
     const { FactoryModule } = await import('../factory.js');
     mockSimulate
       .mockResolvedValueOnce(makeVoidScVal())
@@ -162,10 +162,16 @@ describe('FactoryModule — streamAddress()', () => {
     const factory = new FactoryModule(cfg());
 
     const first  = await factory.streamAddress(7n);
+    // Within the short negative-cache TTL the null is served from cache — no
+    // second RPC.
     const second = await factory.streamAddress(7n);
+    // Dropping the cache forces a fresh resolution, which now finds the stream.
+    factory.clearAddressCache();
+    const third  = await factory.streamAddress(7n);
 
     expect(first).toBeNull();
-    expect(second).not.toBeNull();
+    expect(second).toBeNull();
+    expect(third).not.toBeNull();
     expect(mockSimulate).toHaveBeenCalledTimes(2);
   });
 });

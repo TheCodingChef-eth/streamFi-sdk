@@ -49,7 +49,8 @@ describe('GraphQLIndexer Memory Leak & Real Network I/O Tests', () => {
       body: JSON.stringify({ query: queryStr, variables }),
       signal: expect.any(AbortSignal),
     });
-    expect(result).toEqual(mockResponseData);
+    // query() returns the unwrapped GraphQL `data` payload, not the envelope.
+    expect(result).toEqual(mockResponseData.data);
 
     indexer.cleanup();
   });

@@ -119,7 +119,7 @@ describe('GraphQLIndexer.query() — timeout & AbortSignal (fix for #569)', () =
     const result = await indexer.query({ query: '{ streams { id } }' });
     indexer.cleanup();
 
-    expect(result).toEqual({ data: { streams: [] } });
+    expect(result).toEqual({ streams: [] });
     // Advancing past the timeout must not throw / leak a timer.
     vi.advanceTimersByTime(DEFAULT_INDEXER_TIMEOUT_MS + 1000);
   });
