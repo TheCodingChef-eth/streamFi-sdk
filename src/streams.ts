@@ -321,6 +321,36 @@ export class StreamsModule {
     return parseStreamInfo(id, addr, val);
   }
 
+  /**
+   * Fetch full stream state for many stream IDs with bounded concurrency.
+   *
+   * Returns both successful results and per-id failures so one missing or
+   * broken stream does not fail the whole fan-out. Order of `results` and
+   * `failures` matches the input order.
+   */
+  async getStreamInfos(
+    streamIds: (bigint | string)[],
+    options: import('./types/index.js').GetStreamInfosOptions = {},
+  ): Promise<import('./types/index.js').GetStreamInfosResult> {
+    const ids = streamIds.map(id => BigInt(id));
+    const concurrency = Math.max(1, options.maxConcurrency ?? DEFAULT_LIST_CONCURRENCY);
+
+    const outcomes = await mapWithConcurrency(ids, concurrency, async (id) => {
+      try {
+        const info = await this.get(id);
+        return { ok: true as const, id, info };
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        return { ok: false as const, id, error };
+      }
+    });
+
+    return {
+      results: outcomes.filter(o => o.ok).map(o => o.info),
+      failures: outcomes.filter(o => !o.ok).map(o => ({ id: o.id, error: o.error })),
+    };
+  }
+
   /** Get withdrawable balance - read-only, no transaction. */
   async withdrawable(streamId: bigint | string): Promise<bigint> {
     const id   = BigInt(streamId);
