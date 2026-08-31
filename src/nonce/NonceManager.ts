@@ -195,8 +195,9 @@ export class NonceManager {
 
     const { promise, cancel } = this.enqueue();
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
+      timer = setTimeout(() => {
         cancel();
         reject(new Error(`NonceManager: acquire timed out after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -209,6 +210,8 @@ export class NonceManager {
         throw err;
       }
       throw new Error(String(err));
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

@@ -59,7 +59,7 @@ export class Module49 {
    */
   public processStreamBatch(items: StreamBatchItem49[]): Module49Result[] {
     const startTime = performance.now();
-    const results: Module49Result[] = new Array(items.length);
+    const results: Module49Result[] = [];
 
     for (let i = 0; i < items.length; i += this.batchChunkSize) {
       const chunkEnd = Math.min(i + this.batchChunkSize, items.length);
@@ -67,7 +67,7 @@ export class Module49 {
         const item = items[j];
         if (!item) continue;
 
-        results[j] = this.processSingleItem(item);
+        results.push(this.processSingleItem(item));
       }
     }
 
@@ -84,7 +84,7 @@ export class Module49 {
    */
   public processSingleItem(item: StreamBatchItem49): Module49Result {
     const nowSec = item.timestamp ?? Math.floor(Date.now() / 1000);
-    const cacheKey = `${item.id}_${item.stream.withdrawn.toString()}_${item.stream.paused ? 1 : 0}_${nowSec}`;
+    const cacheKey = `${item.id}_${item.stream.withdrawn.toString()}_${item.stream.paused ? 1 : 0}_${item.stream.cancelled ? 1 : 0}_${item.stream.pausedAt}_${item.stream.ratePerSecond.toString()}_${item.stream.startTime}_${item.stream.endTime}_${nowSec}`;
 
     if (this.enableOptimization) {
       const cached = this.cache.get(cacheKey);
