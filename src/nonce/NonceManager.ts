@@ -215,7 +215,7 @@ export class NonceManager {
    * exhausted.
    *
    * @param retries              number of patience windows
-   * @param delayMs              base backoff between windows (× attempt number)
+   * @param delayMs              base backoff between windows (× 2^attempt)
    * @param perAttemptTimeoutMs  how long each window waits before backing off
    */
   async safeAcquire(
@@ -273,7 +273,7 @@ export class NonceManager {
         // The single waiter is still queued (not cancelled) — just wait a
         // bit longer on the same slot.
         if (attempt < retries - 1) {
-          await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+          await new Promise((r) => setTimeout(r, delayMs * 2 ** attempt));
           if (handedLock) return handedLock;
         }
       }
