@@ -92,6 +92,9 @@ export interface CreateStreamParams {
   ratePerSecond?: string;
 }
 
+/** Configuration for a single stream in a batch creation. */
+export type StreamConfig = CreateStreamParams;
+
 export interface CreateStreamResult {
   streamId:      bigint;
   streamAddress: string;
@@ -122,6 +125,21 @@ export interface PaginatedStreams {
   nextCursor?: string;
 }
 
+export interface GetStreamInfosOptions {
+  /** Maximum number of concurrent RPC simulations. Defaults to 8. */
+  maxConcurrency?: number;
+}
+
+export interface GetStreamInfosFailure {
+  id:    bigint;
+  error: string;
+}
+
+export interface GetStreamInfosResult {
+  results:  StreamInfo[];
+  failures: GetStreamInfosFailure[];
+}
+
 export interface GovernorConfig {
   feeBps:              number;
   feeRecipient?:       string;
@@ -132,12 +150,12 @@ export interface GovernorConfig {
 
 // ── Events ──────────────────────────────────────────────────────────────────
 
-export interface WithdrawEvent  { amount: bigint; recipient: string; totalWithdrawn: bigint; remaining: bigint; sequence: bigint; }
-export interface CancelEvent    { refundAmount: bigint; withdrawnSoFar: bigint; sender: string; sequence: bigint; }
-export interface PauseEvent     { pausedAt: number; withdrawable: bigint; sender: string; sequence: bigint; }
-export interface ResumeEvent    { resumedAt: number; sender: string; sequence: bigint; }
-export interface TopUpEvent     { amount: bigint; newBalance: bigint; sender: string; sequence: bigint; }
-export interface ClawbackEvent  { amount: bigint; sender: string; sequence: bigint; }
+export interface WithdrawEvent  { amount: bigint; recipient: string; totalWithdrawn: bigint; remaining: bigint; sequence?: bigint; }
+export interface CancelEvent    { refundAmount: bigint; withdrawnSoFar: bigint; sender: string; sequence?: bigint; }
+export interface PauseEvent     { pausedAt: number; withdrawable: bigint; sender: string; sequence?: bigint; }
+export interface ResumeEvent    { resumedAt: number; sender: string; sequence?: bigint; }
+export interface TopUpEvent     { amount: bigint; newBalance: bigint; sender: string; sequence?: bigint; }
+export interface ClawbackEvent  { amount: bigint; sender: string; sequence?: bigint; }
 
 /** Published once when the factory deploys a new DripStream (`created` topic). */
 export interface CreatedEvent {
@@ -149,7 +167,7 @@ export interface CreatedEvent {
   ratePerSecond: bigint;
   startTime: number;
   endTime: number;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /**
@@ -164,7 +182,7 @@ export interface ForceCancelEvent {
   payoutAmount: bigint;
   /** Unstreamed remainder refunded to the sender. */
   refundAmount: bigint;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when the recipient role is transferred to a new address (`xfer_rec` topic). */
@@ -172,7 +190,7 @@ export interface RecipientTransferEvent {
   /** The outgoing recipient who initiated the transfer (topics[1] actor). */
   previousRecipient: string;
   newRecipient: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when an operator is delegated on the stream (`set_op` topic). */
@@ -180,7 +198,7 @@ export interface OperatorSetEvent {
   /** The address that granted the operator role (topics[1] actor). */
   sender: string;
   operator: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** Published when a previously-delegated operator is revoked (`rm_op` topic). */
@@ -188,7 +206,7 @@ export interface OperatorRevokedEvent {
   /** The address that revoked the operator role (topics[1] actor). */
   sender: string;
   operator: string;
-  sequence: bigint;
+  sequence?: bigint;
 }
 
 /** A gap detected in the per-contract event sequence — see `DataKey::EventSequence` in contracts/stream/src/events.rs. */
@@ -254,6 +272,16 @@ export interface BatchWithdrawItem {
 export interface BatchWithdrawResult {
   streamId: bigint;
   success: boolean;
+  txHash?: string;
+  error?: string;
+}
+
+export interface BatchCreateStreamResult {
+  /** Index into the configs array passed to createBatchStreams(). */
+  index: number;
+  success: boolean;
+  streamId?: bigint;
+  streamAddress?: string;
   txHash?: string;
   error?: string;
 }

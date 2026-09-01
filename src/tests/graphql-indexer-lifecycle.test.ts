@@ -62,7 +62,7 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     indexer.cleanup();
   });
 
-  it('sends connection_init then subscribe with the query and variables on open', () => {
+  it('sends connection_init on open and defers subscribe until connection_ack', () => {
     const indexer = new GraphQLIndexer(endpoint);
     indexer.subscribe({
       query: 'subscription { streamUpdated { id } }',
@@ -73,8 +73,13 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     mockWs.readyState = 1;
     mockWs.onopen!();
 
-    expect(mockWs.sent).toHaveLength(2);
+    // Only connection_init until the server acks.
+    expect(mockWs.sent).toHaveLength(1);
     expect(JSON.parse(mockWs.sent[0]!)).toEqual({ type: 'connection_init' });
+
+    mockWs.onmessage!({ data: JSON.stringify({ type: 'connection_ack' }) });
+
+    expect(mockWs.sent).toHaveLength(2);
     const subscribeMsg = JSON.parse(mockWs.sent[1]!);
     expect(subscribeMsg.type).toBe('subscribe');
     expect(subscribeMsg.payload).toEqual({
@@ -217,8 +222,12 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     sockets[1]!.readyState = 1;
     sockets[1]!.onopen!();
 
-    expect(sockets[1]!.sent).toHaveLength(2);
+    expect(sockets[1]!.sent).toHaveLength(1);
     expect(JSON.parse(sockets[1]!.sent[0]!)).toEqual({ type: 'connection_init' });
+
+    sockets[1]!.onmessage!({ data: JSON.stringify({ type: 'connection_ack' }) });
+
+    expect(sockets[1]!.sent).toHaveLength(2);
     expect(JSON.parse(sockets[1]!.sent[1]!)).toMatchObject({
       type: 'subscribe',
       payload: {

@@ -40,12 +40,15 @@ export {
   RateLimitError,
   RpcServiceUnavailableError,
   IndexerTimeoutError,
+  OperationAbortedError,
+  isConduitError,
   SUPPORTED_NETWORKS,
   CAIP2_TO_NETWORK,
   UNKNOWN_CONTRACT_ERROR_CODE,
 } from './errors.js';
 export type { ConduitContract } from './errors.js';
 export * from './types/index.js';
+export type { GetStreamInfosOptions, GetStreamInfosResult, GetStreamInfosFailure } from './types/index.js';
 export * from './adapters/index.js';
 export { FeeEstimator } from './fee-estimator.js';
 export type { FeeEstimateOptions } from './fee-estimator.js';
@@ -65,6 +68,7 @@ export {
   normalizeProgress,
   withdrawableLocal,
   bigintSafeStringify,
+  timeoutSignal,
 } from './utils.js';
 
 // RPC server lifecycle

@@ -428,6 +428,11 @@ export interface BatchSubmitOptions {
   sign?: (xdr: string) => Promise<string> | string;
   /** AbortSignal to cancel an in-progress submission. */
   signal?: AbortSignal;
+  /**
+   * Optional progress callback invoked each time a transaction reaches a
+   * terminal state (SUCCESS, FAILED, SKIPPED, or ERROR).
+   */
+  onProgress?: (progress: { index: number; method: string; status: BatchTxStatus }) => void;
 }
 
 const DEFAULT_SUBMIT_POLL_INTERVAL_MS = 1_000;
@@ -470,12 +475,23 @@ export async function submitBatch(
   const outcomes: BatchTxOutcome[] = [];
   let firstFailureIndex = -1;
 
+  function pushOutcome(outcome: BatchTxOutcome) {
+    outcomes.push(outcome);
+    if (options.onProgress) {
+      try {
+        options.onProgress({ index: outcome.index, method: outcome.method, status: outcome.status });
+      } catch (handlerErr) {
+        console.warn('[submitBatch] onProgress handler error:', handlerErr);
+      }
+    }
+  }
+
   for (const built of transactions) {
     // Once a failure is recorded, mark all subsequent txs as SKIPPED.
     // Their pre-assigned sequence numbers have a gap below them and would
     // fail with txBAD_SEQ even if submitted.
     if (firstFailureIndex !== -1) {
-      outcomes.push({
+      pushOutcome({
         index:  built.index,
         method: built.method,
         status: 'SKIPPED',
@@ -485,7 +501,7 @@ export async function submitBatch(
     }
 
     if (options.signal?.aborted) {
-      outcomes.push({
+      pushOutcome({
         index:  built.index,
         method: built.method,
         status: 'SKIPPED',
@@ -502,7 +518,7 @@ export async function submitBatch(
         xdrToSubmit = await options.sign(built.xdr);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        outcomes.push({ index: built.index, method: built.method, status: 'ERROR', error: `Sign failed: ${msg}` });
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Sign failed: ${msg}` });
         firstFailureIndex = built.index;
         continue;
       }
@@ -515,14 +531,14 @@ export async function submitBatch(
       sent = await server.sendTransaction(tx);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      outcomes.push({ index: built.index, method: built.method, status: 'ERROR', error: `Submit failed: ${msg}` });
+      pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Submit failed: ${msg}` });
       firstFailureIndex = built.index;
       continue;
     }
 
     if (sent.status === 'ERROR') {
       const msg = sent.errorResult ? JSON.stringify(sent.errorResult) : 'Transaction rejected by network';
-      outcomes.push({ index: built.index, method: built.method, status: 'FAILED', error: msg });
+      pushOutcome({ index: built.index, method: built.method, status: 'FAILED', error: msg });
       firstFailureIndex = built.index;
       continue;
     }
@@ -535,7 +551,7 @@ export async function submitBatch(
       await new Promise<void>(resolve => setTimeout(resolve, pollIntervalMs));
 
       if (options.signal?.aborted) {
-        outcomes.push({ index: built.index, method: built.method, status: 'ERROR', error: 'Aborted during polling' });
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: 'Aborted during polling' });
         firstFailureIndex = built.index;
         confirmed = true; // Break the poll loop; outer loop will SKIP the rest.
         break;
@@ -546,20 +562,20 @@ export async function submitBatch(
         status = await server.getTransaction(hash);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        outcomes.push({ index: built.index, method: built.method, status: 'ERROR', error: `Poll failed: ${msg}` });
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Poll failed: ${msg}` });
         firstFailureIndex = built.index;
         confirmed = true;
         break;
       }
 
       if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        outcomes.push({ index: built.index, method: built.method, status: 'SUCCESS', txHash: hash });
+        pushOutcome({ index: built.index, method: built.method, status: 'SUCCESS', txHash: hash });
         confirmed = true;
         break;
       }
 
       if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        outcomes.push({ index: built.index, method: built.method, status: 'FAILED', error: `Transaction failed on-chain: ${hash}` });
+        pushOutcome({ index: built.index, method: built.method, status: 'FAILED', error: `Transaction failed on-chain: ${hash}` });
         firstFailureIndex = built.index;
         confirmed = true;
         break;
@@ -569,7 +585,7 @@ export async function submitBatch(
 
     if (!confirmed) {
       // Exhausted poll attempts without a terminal status.
-      outcomes.push({ index: built.index, method: built.method, status: 'ERROR', error: `Transaction timed out after ${maxPollAttempts} poll attempts: ${hash}` });
+      pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Transaction timed out after ${maxPollAttempts} poll attempts: ${hash}` });
       firstFailureIndex = built.index;
     }
   }

@@ -18,6 +18,7 @@ import {
 import type { Network } from './types/index.js';
 import type { Signer } from './signer.js';
 import { RateLimitError, StreamFiNetworkError, InsufficientBalanceError } from './errors.js';
+import { withRetry } from './with-retry.js';
 
 // ── RPC Server cache ─────────────────────────────────────────────────────────
 // Reusing SorobanRpc.Server instances avoids creating a new HTTP agent per
@@ -100,40 +101,17 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 
   const server = getServer(rpcUrl);
 
-  const ASYNC_METHODS = [
-    'getAccount',
-    'getEvents',
-    'simulateTransaction',
-    'getTransaction',
-    'getLatestLedger',
-    'getNetwork',
-  ];
+  const EXCLUDED_METHODS = ['constructor'];
 
   const proxied = new Proxy(server, {
     get(target, propKey, receiver) {
       const origMethod = Reflect.get(target, propKey, receiver) as unknown;
-      if (typeof origMethod === 'function' && typeof propKey === 'string' && ASYNC_METHODS.includes(propKey)) {
+      if (typeof origMethod === 'function' && typeof propKey === 'string' && !EXCLUDED_METHODS.includes(propKey)) {
         return async function (...args: unknown[]) {
-          const MAX_RETRIES = 3;
-          let delay = 500;
-
-          for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            try {
-              return await (origMethod as (...a: unknown[]) => Promise<unknown>).apply(target, args);
-            } catch (err) {
-              const classified = RateLimitError.fromRpcError(err);
-
-              // Only a genuine RateLimitError (HTTP 429 / JSON-RPC 429) is
-              // retried with backoff. A 503 is classified as
-              // RpcServiceUnavailableError and thrown immediately.
-              if (!(classified instanceof RateLimitError) || attempt === MAX_RETRIES) {
-                throw classified ?? err;
-              }
-              const waitTime = classified.retryAfterMs ?? delay;
-              await sleep(waitTime);
-              delay *= 2; // Backoff factor: 2x
-            }
-          }
+          return withRetry(
+            () => (origMethod as (...a: unknown[]) => Promise<unknown>).apply(target, args),
+            { maxRetries: 3, baseDelayMs: 500, backoffFactor: 2 },
+          );
         };
       }
       return Reflect.get(target, propKey, receiver);
@@ -511,6 +489,14 @@ export async function queryXlmBalance(
  * 500 XLM fallback overstated the required balance by ~500 XLM (see #430).
  */
 export const DEFAULT_RESOURCE_FEE_ESTIMATE = 1_000_000n;
+
+/**
+ * Larger fallback used for expensive operations that deploy or instantiate
+ * contracts (e.g. `create_stream`). This is a conservative default sized in
+ * stroops (3 XLM) to avoid under-estimating required balance in the
+ * insufficient-balance error path when the simulation carries no fee fields.
+ */
+export const CREATE_RESOURCE_FEE_ESTIMATE = 30_000_000n;
 
 /**
  * Estimate the minimum resource fee required for a transaction simulation.

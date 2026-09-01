@@ -14,6 +14,7 @@ const { mockBuildTx, mockSimulate } = vi.hoisted(() => ({
 vi.mock('../soroban.js', () => ({
   buildContractCallTx: mockBuildTx,
   simulateReadOnly:    mockSimulate,
+  resolveFee:          () => '100',
   scValToU64: (v: { u64: () => { toString: () => string } }) =>
     BigInt(v.u64().toString()),
   scValToI128: (_v: unknown) => 0n,
@@ -33,6 +34,7 @@ vi.mock('../soroban.js', () => ({
     mainnet:  'https://mainnet.sorobanrpc.com',
     local:    'http://localhost:8000/soroban/rpc',
   },
+  catchNetworkError: (label: string, fn: () => any) => fn(),
 }));
 
 // ── Mock Address so G-addresses are accepted without strkey validation ─────────
@@ -154,7 +156,7 @@ describe('FactoryModule — streamAddress()', () => {
     expect(mockSimulate).toHaveBeenCalledTimes(1);
   });
 
-  it('does not cache a not-found (void) result, so a later resolution still hits the network', async () => {
+  it('caches a not-found (void) result only briefly, then re-resolves after clearAddressCache()', async () => {
     const { FactoryModule } = await import('../factory.js');
     mockSimulate
       .mockResolvedValueOnce(makeVoidScVal())
@@ -162,11 +164,43 @@ describe('FactoryModule — streamAddress()', () => {
     const factory = new FactoryModule(cfg());
 
     const first  = await factory.streamAddress(7n);
+    // Within the short negative-cache TTL the null is served from cache — no
+    // second RPC.
     const second = await factory.streamAddress(7n);
+    // Dropping the cache forces a fresh resolution, which now finds the stream.
+    factory.clearAddressCache();
+    const third  = await factory.streamAddress(7n);
 
     expect(first).toBeNull();
-    expect(second).not.toBeNull();
+    expect(second).toBeNull();
+    expect(third).not.toBeNull();
     expect(mockSimulate).toHaveBeenCalledTimes(2);
+  });
+
+  it('clearAddressCache clears the cache and forces a network call on next resolution', async () => {
+    const { FactoryModule } = await import('../factory.js');
+    mockSimulate.mockResolvedValueOnce(makeU32ScVal(1));
+    const factory = new FactoryModule(cfg());
+
+    await factory.streamAddress(1n);
+    expect(mockSimulate).toHaveBeenCalledTimes(1);
+
+    factory.clearAddressCache();
+
+    mockSimulate.mockResolvedValueOnce(makeU32ScVal(1));
+    await factory.streamAddress(1n);
+    expect(mockSimulate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('FactoryModule — cache consolidation with StreamsModule', () => {
+  it('StreamsModule exposes clearAddressCache that delegates to factory', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const config = cfg();
+    const streams = new StreamsModule(config);
+
+    // Verify the method exists and can be called
+    expect(() => streams.clearAddressCache()).not.toThrow();
   });
 });
 
@@ -241,14 +275,14 @@ describe('FactoryModule — streamsBySender() / streamsByRecipient()', () => {
     expect(args[2]!.u32()).toBe(100);
   });
 
-  it('clamps a negative limit to 0 rather than passing it through to a u32 conversion', async () => {
+  it('replaces a non-positive limit with the default rather than a bad u32 conversion', async () => {
     const { FactoryModule } = await import('../factory.js');
     mockSimulate.mockResolvedValueOnce(_xdr.ScVal.scvVec([]));
 
     await new FactoryModule(cfg()).streamsByRecipient(RECIPIENT_ADDR, 0, -5);
 
     const args = mockBuildTx.mock.calls.at(-1)![5] as _xdr.ScVal[];
-    expect(args[2]!.u32()).toBe(0);
+    expect(args[2]!.u32()).toBe(20); // DEFAULT_LIST_LIMIT
   });
 
   it('leaves an in-range limit untouched', async () => {

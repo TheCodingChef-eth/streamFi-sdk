@@ -20,32 +20,44 @@ npm install @conduit-protocol/sdk
 
 ## Quickstart
 
+A complete, copy-pasteable create -> withdraw script on **testnet**. A runnable
+version lives at [`examples/quickstart.ts`](examples/quickstart.ts).
+
 ```typescript
 import { ConduitClient, fromStroops } from '@conduit-protocol/sdk';
 import { Keypair } from '@stellar/stellar-sdk';
 
+// Generate a testnet key and fund it once:
+//   const kp = Keypair.random();
+//   await fetch(`https://friendbot.stellar.org?addr=${kp.publicKey()}`);
+const keypair = Keypair.fromSecret(process.env.STELLAR_SECRET!);
+
 const client = new ConduitClient({
-  network:  'testnet',
-  keypair:  Keypair.fromSecret('S...'),
+  network:        'testnet',
+  keypair,
+  factoryAddress: process.env.FACTORY_ADDRESS!,   // testnet DripFactory contract id
 });
 
-// Create a 30-day USDC stream
-const { streamId } = await client.streams.create({
-  recipient:       'GABC...XYZ',
-  token:           'USDC',
-  depositAmount:   '1000',              // 1 000 USDC
-  durationSeconds: 30 * 24 * 3600,     // 30 days
-});
+async function main() {
+  // Stream 100 XLM to the recipient over one hour (the 1-hour minimum).
+  const { streamId, txHash } = await client.streams.create({
+    recipient:       keypair.publicKey(),   // self, for a runnable demo
+    token:           'native',              // XLM
+    depositAmount:   '100',
+    durationSeconds: 60 * 60,
+  });
+  console.log('stream', streamId, 'created  (tx', txHash + ')');
 
-console.log('Stream created:', streamId);
-// Recipient earns ≈ 0.000386 USDC / second
+  // Let value accrue, then withdraw the full available balance as the recipient.
+  await new Promise((r) => setTimeout(r, 15_000));
+  const available = await client.streams.withdrawable(streamId);
+  console.log('withdrawable:', fromStroops(available), 'XLM');
 
-// Check withdrawable balance (in stroops — the token's smallest unit)
-const available = await client.streams.withdrawable(streamId);
-console.log('Available:', fromStroops(available), 'USDC');
+  const withdrawTx = await client.streams.withdraw(streamId, available);
+  console.log('withdrawn  (tx', withdrawTx + ')');
+}
 
-// Withdraw
-await client.streams.withdraw(streamId, available);
+main().catch(console.error);
 ```
 
 ---
@@ -544,6 +556,32 @@ calculateRate('1000', 2592000) // → 38580n  (stroops/sec)
 streamProgress(stream)         // → 0.42
 ```
 
+### `AbortSignal` & timeouts
+
+Methods that do network I/O (`GraphQLIndexer.query`, batch/builder submission,
+...) accept an optional `signal: AbortSignal`. To bound one by time, pass
+`AbortSignal.timeout(ms)` — but note it needs **Node >= 17.3**, Deno >= 1.20,
+Chrome >= 103, Firefox >= 100, or Safari >= 15.4.
+
+For older runtimes use the SDK's `timeoutSignal(ms)` helper (native when
+available, `AbortController` + `setTimeout` otherwise):
+
+```typescript
+import { timeoutSignal } from '@conduit-protocol/sdk';
+
+const data = await indexer.query({ query: GET_STREAMS, signal: timeoutSignal(5_000) });
+```
+
+Or hand-roll the polyfill:
+
+```typescript
+function timeoutSignal(ms: number): AbortSignal {
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+```
+
 ---
 
 ## Types
@@ -749,3 +787,4 @@ The SDK can be configured via environment variables or explicit constructor opti
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
+\n## ConduitConfig reference\n\n| Field | Type | Default | Effect |\n|---|---|---|---|\n| network | \`mainnet | testnet | local\` | (required) | Which Stellar network to connect to. |\n| keypair | \`Keypair\` | undefined | Signing keypair used for mutating operations. |\n| wallet | \`WalletAdapter\` | undefined | Browser/mobile wallet adapter (e.g. WalletConnect). |\n| signer | \`Signer\` | undefined | Custom signer plugin (KMS/HSM). Takes precedence over keypair. |\n| rpcUrl | \`string\` | Network default | Override the default Soroban RPC endpoint. |\n| factoryAddress | \`string\` | Network default | Override the deployed DripFactory contract ID. |\n| governorAddress | \`string\` | Network default | Override the deployed DripGovernor contract ID. |\n| confirmationPollIntervalMs | \`number\` | 1000 | Poll interval for transaction confirmation. |\n| confirmationMaxAttempts | \`number\` | 30 | Maximum confirmation polling attempts. |\n| fee | \`string\` | undefined | Explicit inclusion fee in stroops. Takes precedence over feeMultiplier. |\n| feeMultiplier | \`number\` | 1 | Multiplier applied to BASE_FEE when fee is not set. |\n\n

@@ -94,9 +94,10 @@ export class FactoryModule {
    * Resolve the read-simulation source address, consulting the wallet
    * adapter (which may be async, e.g. a browser extension or hardware
    * device) rather than pinning `keypair?.publicKey() ?? ZERO_ADDR` at
-   * construction time (#570). Cached after first resolution; invalidated by
-   * {@link setWallet}. Falls back to `ZERO_ADDR` — Soroban does not require a
-   * real source account for a read-only simulation.
+   * construction time (#570). Cached after first resolution once a valid
+   * public key is resolved; does not cache null/ZERO_ADDR (#562);
+   * invalidated by {@link setWallet}. Falls back to `ZERO_ADDR` — Soroban
+   * does not require a real source account for a read-only simulation.
    */
   private async _resolveCallerAddress(): Promise<string> {
     if (this._cachedCallerAddr !== null) {
@@ -105,7 +106,11 @@ export class FactoryModule {
     let addr: string;
     if (this.activeWallet) {
       const pk = await this.activeWallet.getPublicKey();
-      addr = pk ?? ZERO_ADDR;
+      if (pk && pk !== ZERO_ADDR) {
+        this._cachedCallerAddr = pk;
+        return pk;
+      }
+      return ZERO_ADDR;
     } else if (this.config.signer) {
       addr = this.config.signer.publicKey();
     } else if (this.config.keypair) {
@@ -113,7 +118,9 @@ export class FactoryModule {
     } else {
       addr = ZERO_ADDR;
     }
-    this._cachedCallerAddr = addr;
+    if (addr && addr !== ZERO_ADDR) {
+      this._cachedCallerAddr = addr;
+    }
     return addr;
   }
 

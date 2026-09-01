@@ -414,4 +414,63 @@ describe('WebSocketRelayer — High-Concurrency Stress Tests', () => {
 
     doomed.destroy();
   });
+
+  it('resets reconnecting state to false and aborts mid-reconnect on disconnect() (#619)', async () => {
+    class FailingOnceWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+
+      constructor() {
+        setTimeout(() => {
+          this.onerror?.();
+          this.onclose?.();
+        }, 0);
+      }
+    }
+
+    (global as any).WebSocket = vi.fn(function () { return new FailingOnceWebSocket(); }) as any;
+    
+    let disconnectCount = 0;
+    const relayer = new WebSocketRelayer('ws://localhost:65532', {
+      maxReconnectAttempts: 5,
+      reconnectDelayMs: 20,
+      onStateChange: (transition) => {
+        if (transition === 'disconnected') {
+          disconnectCount++;
+        }
+      },
+    });
+
+    const connectPromise = relayer.connect().catch(() => {});
+
+    await new Promise((resolve) => {
+      const unsub = relayer.onStateChange((transition) => {
+        if (transition === 'reconnecting') {
+          unsub();
+          resolve(undefined);
+        }
+      });
+    });
+
+    expect(relayer.state.reconnecting).toBe(true);
+    
+    disconnectCount = 0;
+    relayer.disconnect();
+    
+    expect(relayer.state.reconnecting).toBe(false);
+    expect(disconnectCount).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    
+    expect((global as any).WebSocket).toHaveBeenCalledTimes(1);
+    expect(disconnectCount).toBe(1);
+
+    await connectPromise;
+    relayer.destroy();
+  });
 });

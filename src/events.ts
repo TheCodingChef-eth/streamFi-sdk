@@ -77,6 +77,14 @@ function addressFieldAt(fields: xdr.ScVal[], index: number): string {
  * on it yields `"[object Object]"`. `Address.fromScVal` handles both account
  * and contract address variants correctly.
  */
+/** Read the sequence topic (topics[2]) from a raw event, if present. */
+function sequenceOf(event: SorobanRpc.Api.EventResponse): bigint | undefined {
+  const topics = event.topic;
+  if (!topics || topics.length < 3) return undefined;
+  const seq = topics[2];
+  return seq ? scValToU64(seq) : undefined;
+}
+
 function addressField(val: xdr.ScVal | undefined): string {
   if (!val) return '';
   try {
@@ -113,7 +121,47 @@ export function subscribeToStream(
   let   timer: ReturnType<typeof setTimeout> | undefined;
   // Last per-contract event sequence seen (topics[2]), for gap detection
   // across a poll or reconnect — see contracts/stream/src/events.rs.
+  // Ledger used to seed the last successful poll; kept for gap backfills.
+  let   lastStartLedger = 0;
+  // Guard against recursive gap detection while a replay is in flight.
+  let   isReplaying = false;
   let   lastSequence: bigint | undefined;
+
+  /**
+   * Backfill events whose sequence falls inside a detected gap.
+   *
+   * When polling resumes after a delay or reconnect, the RPC may return
+   * a later sequence while the subscriber never saw the events in between.
+   * Re-fetch events from the last known ledger and dispatch any missed
+   * events in sequence order so withdraw/pause/etc handlers fire as if
+   * the events had been received originally.
+   */
+  async function replayGap(expected: bigint, actual: bigint) {
+    if (isReplaying || lastStartLedger <= 0) return;
+    isReplaying = true;
+    try {
+      const backfill = await server.getEvents({
+        startLedger: lastStartLedger,
+        filters: [{ type: 'contract', contractIds: [streamAddress] }],
+        limit: 200,
+      });
+
+      const missed = backfill.events
+        .map((event) => ({ event, seq: sequenceOf(event) }))
+        .filter((item): item is { event: SorobanRpc.Api.EventResponse; seq: bigint } =>
+          item.seq !== undefined && item.seq > expected && item.seq < actual,
+        )
+        .sort((a, b) => (a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : 0));
+
+      for (const item of missed) {
+        dispatchEvent(item.event, handlers);
+      }
+    } catch (err) {
+      console.warn('[conduit-sdk] event replay failed:', err);
+    } finally {
+      isReplaying = false;
+    }
+  }
 
   async function poll() {
     if (stopped) return;
@@ -128,6 +176,7 @@ export function subscribeToStream(
         // fail identically (see #484).
         const latest = await server.getLatestLedger();
         startLedger = latest.sequence;
+        lastStartLedger = startLedger;
         ledgerSeeded = true;
       }
 
@@ -152,6 +201,10 @@ export function subscribeToStream(
               } catch (handlerError) {
                 console.warn('[conduit-sdk] event polling onGap handler error:', handlerError);
               }
+              // Fire-and-forget replay of missed events; poll loop continues.
+              replayGap(lastSequence, sequence).catch((err) =>
+                console.warn('[conduit-sdk] replayGap invocation failed:', err),
+              );
             }
             lastSequence = sequence;
           }
@@ -167,6 +220,7 @@ export function subscribeToStream(
         cursor = undefined;
         if (response.latestLedger !== undefined) {
           startLedger = response.latestLedger + 1;
+          lastStartLedger = response.latestLedger;
         }
       }
 
@@ -243,7 +297,11 @@ export function dispatchEvent(
   const topicName = topics[0]?.sym()?.toString() ?? '';
 
   const actor    = addressField(topics[1]);
-  const sequence = topics[2] ? scValToU64(topics[2]) : 0n;
+  const sequence = topics[2] ? scValToU64(topics[2]) : undefined;
+  // Spread this into each decoded event so an absent sequence topic leaves
+  // the optional `sequence` field off entirely rather than set to
+  // `undefined` (which `exactOptionalPropertyTypes` rejects).
+  const seq: { sequence?: bigint } = sequence === undefined ? {} : { sequence };
 
   switch (topicName) {
     case TOPIC.WITHDRAWN: {
@@ -255,7 +313,7 @@ export function dispatchEvent(
         amount:         i128Field(fields, 0),
         totalWithdrawn: i128Field(fields, 1),
         remaining:      i128Field(fields, 2),
-        sequence,
+        ...seq,
       };
       handlers.onWithdraw(data);
       break;
@@ -269,7 +327,7 @@ export function dispatchEvent(
         sender:         actor,
         refundAmount:   i128Field(fields, 0),
         withdrawnSoFar: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onCancel(data);
       break;
@@ -283,7 +341,7 @@ export function dispatchEvent(
         sender:       actor,
         pausedAt:     u64Field(fields, 0),
         withdrawable: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onPause(data);
       break;
@@ -296,7 +354,7 @@ export function dispatchEvent(
       const data: ResumeEvent = {
         sender:    actor,
         resumedAt: Number(scValToU64(event.value)),
-        sequence,
+        ...seq,
       };
       handlers.onResume(data);
       break;
@@ -310,7 +368,7 @@ export function dispatchEvent(
         sender:     actor,
         amount:     i128Field(fields, 0),
         newBalance: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onTopUp(data);
       break;
@@ -322,7 +380,7 @@ export function dispatchEvent(
       const data: ClawbackEvent = {
         sender: actor,
         amount: scValToI128(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onClawback(data);
       break;
@@ -340,7 +398,7 @@ export function dispatchEvent(
         ratePerSecond:  i128Field(fields, 3),
         startTime:      u64Field(fields, 4),
         endTime:        u64Field(fields, 5),
-        sequence,
+        ...seq,
       };
       handlers.onCreated(data);
       break;
@@ -355,7 +413,7 @@ export function dispatchEvent(
         recipient:    actor,
         payoutAmount: i128Field(fields, 0),
         refundAmount: i128Field(fields, 1),
-        sequence,
+        ...seq,
       };
       handlers.onForceCancel(data);
       break;
@@ -367,7 +425,7 @@ export function dispatchEvent(
       const data: RecipientTransferEvent = {
         previousRecipient: actor,
         newRecipient:      addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onRecipientTransfer(data);
       break;
@@ -379,7 +437,7 @@ export function dispatchEvent(
       const data: OperatorSetEvent = {
         sender:   actor,
         operator: addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onOperatorSet(data);
       break;
@@ -391,7 +449,7 @@ export function dispatchEvent(
       const data: OperatorRevokedEvent = {
         sender:   actor,
         operator: addressField(event.value),
-        sequence,
+        ...seq,
       };
       handlers.onOperatorRevoke(data);
       break;

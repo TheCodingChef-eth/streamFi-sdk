@@ -21,6 +21,13 @@ vi.mock('@stellar/stellar-sdk', async () => {
   const actual = await vi.importActual('@stellar/stellar-sdk');
   return {
     ...actual,
+    // submitBatch wraps each stub XDR in `new Transaction(xdr, passphrase)`
+    // before handing it to the mocked server; the fixtures use placeholder
+    // strings ("XDR_0", ...) that the real parser would reject, so stub the
+    // constructor to a transparent carrier.
+    Transaction: vi.fn().mockImplementation(function MockTransaction(xdr: string) {
+      return { _xdr: xdr, toXDR: () => xdr };
+    }),
     SorobanRpc: {
       ...(actual as any).SorobanRpc,
       Server: vi.fn().mockImplementation(function MockServer() {
@@ -51,8 +58,6 @@ function makeTx(index: number, method = 'op'): BuiltBatchTransaction {
   return { index, method, xdr: `XDR_${index}`, prepared: true };
 }
 
-const SEND_OK   = { status: 'PENDING', hash: 'HASH' };
-const STATUS_OK = { status: SorobanRpc.Api.GetTransactionStatus.SUCCESS };
 const STATUS_FAILED = { status: SorobanRpc.Api.GetTransactionStatus.FAILED };
 
 // sendTransaction returns the hash suffixed by index so tests can distinguish
@@ -98,11 +103,6 @@ describe('submitBatch — argument validation', () => {
 
 describe('submitBatch — successful batch', () => {
   it('submits all transactions in order and reports SUCCESS for each', async () => {
-    mockSendTransaction.mockImplementation(async (tx: any) => {
-      // extract the index from the stub XDR_N so we can tie hash back to it
-      const idx = String(tx).includes('XDR_') ? 0 : 0;
-      return SEND_OK;
-    });
     mockSendTransaction
       .mockResolvedValueOnce(sendOk(0))
       .mockResolvedValueOnce(sendOk(1))
@@ -257,6 +257,72 @@ describe('submitBatch — stop on failure (#518 core regression)', () => {
     expect(result.outcomes[1]!.status).toBe('SKIPPED');
     // Only one sendTransaction call — tx 1 was never submitted.
     expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('submitBatch — onProgress callback', () => {
+  it('emits a progress event for every terminal outcome', async () => {
+    mockSendTransaction
+      .mockResolvedValueOnce(sendOk(0))
+      .mockResolvedValueOnce(sendOk(1))
+      .mockResolvedValueOnce(sendOk(2));
+    mockGetTransaction.mockResolvedValue(statusOk());
+
+    const progress: { index: number; method: string; status: string }[] = [];
+    const onProgress = vi.fn((p) => progress.push(p));
+
+    const result = await submitBatch(
+      [makeTx(0, 'withdraw'), makeTx(1, 'pause'), makeTx(2, 'cancel')],
+      RPC_URL,
+      { ...OPTS, onProgress },
+    );
+
+    expect(result.allSucceeded).toBe(true);
+    expect(onProgress).toHaveBeenCalledTimes(3);
+    expect(progress.map(p => ({ index: p.index, method: p.method, status: p.status })))
+      .toEqual([
+        { index: 0, method: 'withdraw', status: 'SUCCESS' },
+        { index: 1, method: 'pause', status: 'SUCCESS' },
+        { index: 2, method: 'cancel', status: 'SUCCESS' },
+      ]);
+  });
+
+  it('reports FAILED then SKIPPED for remaining transactions after a failure', async () => {
+    mockSendTransaction
+      .mockResolvedValueOnce(sendOk(0))
+      .mockResolvedValueOnce({ status: 'ERROR', errorResult: 'txBAD_AUTH' });
+    mockGetTransaction.mockResolvedValueOnce(statusOk());
+
+    const onProgress = vi.fn();
+    const result = await submitBatch(
+      [makeTx(0), makeTx(1), makeTx(2)],
+      RPC_URL,
+      { ...OPTS, onProgress },
+    );
+
+    expect(result.firstFailureIndex).toBe(1);
+    expect(onProgress).toHaveBeenCalledTimes(3);
+    expect(onProgress).toHaveBeenNthCalledWith(1, { index: 0, method: 'op', status: 'SUCCESS' });
+    expect(onProgress).toHaveBeenNthCalledWith(2, { index: 1, method: 'op', status: 'FAILED' });
+    expect(onProgress).toHaveBeenNthCalledWith(3, { index: 2, method: 'op', status: 'SKIPPED' });
+  });
+
+  it('does not let an onProgress exception break the batch', async () => {
+    mockSendTransaction.mockResolvedValue(sendOk(0));
+    mockGetTransaction.mockResolvedValue(statusOk());
+
+    const onProgress = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('progress UI crashed'); });
+
+    const result = await submitBatch(
+      [makeTx(0), makeTx(1)],
+      RPC_URL,
+      { ...OPTS, onProgress },
+    );
+
+    expect(result.allSucceeded).toBe(true);
+    expect(onProgress).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -5,6 +5,8 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 ## [Unreleased]
 
 ### Added
+- `timeoutSignal(ms)` utility (exported from the package root and `/utils`) — a portable `AbortSignal` that aborts after `ms`, using the native `AbortSignal.timeout()` when available and falling back to `AbortController` + `setTimeout` (with `unref()` on Node) otherwise. Pass it as `signal` to any method that accepts one (#634).
+- `examples/quickstart.ts` — a runnable, end-to-end create -> accrue -> withdraw script on testnet, and the README Quickstart now mirrors it (#633).
 - `GraphQLIndexer.query()` now accepts optional `timeoutMs` (default 15s) and `signal` on `GraphQLQueryOptions` and wires a per-request `AbortController` into the underlying `fetch`, so a hung/slow indexer no longer leaves the caller's `await` pending forever. On timeout it rejects with a `IndexerTimeoutError` (endpoint + `timeoutMs` exposed); a caller-supplied `signal` surfaces the underlying `AbortError`. `IndexerTimeoutError` and `DEFAULT_INDEXER_TIMEOUT_MS` are exported from the package entry point (#569).
 - `CAIP2_TO_NETWORK` is now exported — a single CAIP-2→network map shared by `ConduitClient`'s wallet-network check and `WalletConnectAdapter`'s construction-time validation, which previously kept independent verbatim copies (#445)
 - `NonceManager` (with its `NonceLock` / `NonceManagerOptions` types) is now exported from the package entry point; the bigint-based `src/nonce/NonceManager.ts` is the only implementation (#483)
@@ -54,6 +56,7 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 - Documented `StreamBuilder.startTime()`/`endTime()`/`clawbackEnabled()`/`toContractArgs()`/`toBatchOperation()` in `docs/api.md`, and added a note under `ConduitBatcher` clarifying that `execute()` alone cannot build a real `create_stream` invocation (#435).
 
 ### Fixed
+- `formatAmount()` no longer returns a signed-zero string (`"-0"`) for negative stroop values that scale to nothing, and a non-finite `decimals` argument now falls back to 7 instead of producing `NaN`-scaled output. Property/fuzz tests lock the round-trip and no-throw invariants (#618).
 - `ConduitBatcher.execute()`'s `create_stream` path now builds ABI-exact positional args — `deposit_amount`/`rate_per_sec` as `i128`, `start_time`/`end_time` as `u64` (honoring `startTime`/`endTime`/`clawbackEnabled` when present) — instead of feeding raw values through the old blanket i64/i128 encoding (#497).
 - Removed a duplicate `let consecutiveFailures = 0;` declaration in `src/events.ts` that made the module a `SyntaxError` at load time, breaking `npm run typecheck`, the `npm ci` build, and every event-subscription test.
 - `GraphQLIndexer.subscribe()` no longer tears down silently when the WebSocket closes. An unexpected close calls `onError` and retries with the same linear backoff as `WebSocketRelayer` (`reconnectDelayMs * attempt`, default 5 attempts / 1000ms). The subscription is removed only after the retry budget is exhausted or the caller unsubscribes. Optional `maxReconnectAttempts` / `reconnectDelayMs` are rejected if they are not integers in range. SSE fallback is unchanged (#514).

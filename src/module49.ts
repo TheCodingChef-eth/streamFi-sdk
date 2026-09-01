@@ -1,5 +1,5 @@
 import type { StreamInfo } from './types/index.js';
-import { withdrawableLocal } from './utils.js';
+import { withdrawableLocal, streamProgress, normalizeProgress } from './utils.js';
 import { LruMemoCache } from './lru-memo-cache.js';
 
 export interface Module49Config {
@@ -59,7 +59,7 @@ export class Module49 {
    */
   public processStreamBatch(items: StreamBatchItem49[]): Module49Result[] {
     const startTime = performance.now();
-    const results: Module49Result[] = new Array(items.length);
+    const results: Module49Result[] = [];
 
     for (let i = 0; i < items.length; i += this.batchChunkSize) {
       const chunkEnd = Math.min(i + this.batchChunkSize, items.length);
@@ -67,13 +67,12 @@ export class Module49 {
         const item = items[j];
         if (!item) continue;
 
-        results[j] = this.processSingleItem(item);
+        results.push(this.processSingleItem(item));
       }
     }
 
     const elapsed = performance.now() - startTime;
     this.totalExecutionTimeMs += elapsed;
-    this.totalProcessed += items.length;
 
     return results;
   }
@@ -83,7 +82,11 @@ export class Module49 {
    */
   public processSingleItem(item: StreamBatchItem49): Module49Result {
     const nowSec = item.timestamp ?? Math.floor(Date.now() / 1000);
-    const cacheKey = `${item.id}_${item.stream.withdrawn.toString()}_${item.stream.paused ? 1 : 0}_${nowSec}`;
+    const cacheKey = `${item.id}_${item.stream.withdrawn.toString()}_${item.stream.paused ? 1 : 0}_${item.stream.cancelled ? 1 : 0}_${item.stream.pausedAt}_${item.stream.ratePerSecond.toString()}_${item.stream.startTime}_${item.stream.endTime}_${nowSec}`;
+
+    // Every item that reaches here is processed, whether it is served from
+    // the cache or computed fresh below.
+    this.totalProcessed++;
 
     if (this.enableOptimization) {
       const cached = this.cache.get(cacheKey);
@@ -102,17 +105,7 @@ export class Module49 {
     this.cacheMisses++;
     const withdrawable = withdrawableLocal(item.stream, nowSec);
 
-    let progress = 0;
-    const { startTime, endTime } = item.stream;
-    if (nowSec >= startTime) {
-      if (endTime === 0) {
-        progress = 0.5; // open-ended active
-      } else if (nowSec >= endTime) {
-        progress = 1.0;
-      } else {
-        progress = (nowSec - startTime) / (endTime - startTime);
-      }
-    }
+    const progress = normalizeProgress(streamProgress(item.stream, nowSec));
 
     const computedAt = nowSec;
 
