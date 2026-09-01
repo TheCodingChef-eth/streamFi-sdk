@@ -92,6 +92,9 @@ export interface CreateStreamParams {
   ratePerSecond?: string;
 }
 
+/** Configuration for a single stream in a batch creation. */
+export type StreamConfig = CreateStreamParams;
+
 export interface CreateStreamResult {
   streamId:      bigint;
   streamAddress: string;
@@ -269,6 +272,16 @@ export interface BatchWithdrawItem {
 export interface BatchWithdrawResult {
   streamId: bigint;
   success: boolean;
+  txHash?: string;
+  error?: string;
+}
+
+export interface BatchCreateStreamResult {
+  /** Index into the configs array passed to createBatchStreams(). */
+  index: number;
+  success: boolean;
+  streamId?: bigint;
+  streamAddress?: string;
   txHash?: string;
   error?: string;
 }
