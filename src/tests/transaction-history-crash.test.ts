@@ -300,6 +300,20 @@ describe('#136 — normalisation of hostile indexer payloads', () => {
     expect(result).toHaveLength(1);
   });
 
+  it('synthesizes composite keys when id and hash are absent to prevent false dedup', () => {
+    const events = [
+      { streamId: '5', kind: 'PAUSE', timestamp: 1_700_000_100 },
+      { streamId: '5', kind: 'RESUME', timestamp: 1_700_000_200 },
+      { streamId: '5', kind: 'WITHDRAW', timestamp: 1_700_000_300 },
+    ];
+    const result = normalizeTransactions(events);
+    expect(result).toHaveLength(3);
+    // 10-digit second epochs are normalised to milliseconds (× 1000).
+    expect(result[0]?.id).toBe('5:PAUSE:1700000100000');
+    expect(result[1]?.id).toBe('5:RESUME:1700000200000');
+    expect(result[2]?.id).toBe('5:WITHDRAW:1700000300000');
+  });
+
   it('fills defaults for every missing field', () => {
     const record = normalizeTransaction({ id: 'bare' });
     expect(record).not.toBeNull();
@@ -358,6 +372,110 @@ describe('#136 — normalisation of hostile indexer payloads', () => {
     expect(normalizeTransaction({ amount: '1' })).toBeNull();
     expect(normalizeTransaction(null)).toBeNull();
     expect(normalizeTransaction([])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. Direction derivation from the connected wallet (ISSUE-566)
+// ---------------------------------------------------------------------------
+
+describe('#566 — direction is derived from the connected wallet', () => {
+  const WALLET = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+  it('keeps an explicit indexer direction even when a wallet is supplied', () => {
+    const record = normalizeTransaction(
+      makeRaw({ kind: 'WITHDRAW', direction: 'OUT' }),
+      WALLET,
+    );
+    expect(record?.direction).toBe('OUT');
+  });
+
+  it('derives IN for WITHDRAW (wallet is the recipient)', () => {
+    const record = normalizeTransaction(
+      makeRaw({ kind: 'WITHDRAW', direction: undefined }),
+      WALLET,
+    );
+    expect(record?.direction).toBe('IN');
+  });
+
+  it('derives OUT for CREATE and TOP_UP (wallet is the sender)', () => {
+    expect(
+      normalizeTransaction(makeRaw({ kind: 'CREATE', direction: undefined }), WALLET)
+        ?.direction,
+    ).toBe('OUT');
+    expect(
+      normalizeTransaction(makeRaw({ kind: 'TOP_UP', direction: undefined }), WALLET)
+        ?.direction,
+    ).toBe('OUT');
+    expect(
+      normalizeTransaction(makeRaw({ kind: 'create', direction: undefined }), WALLET)
+        ?.direction,
+    ).toBe('OUT');
+  });
+
+  it('leaves non-directional kinds as UNKNOWN', () => {
+    for (const kind of ['PAUSE', 'RESUME', 'CANCEL']) {
+      expect(
+        normalizeTransaction(makeRaw({ kind, direction: undefined }), WALLET)
+          ?.direction,
+      ).toBe('UNKNOWN');
+    }
+  });
+
+  it('falls back to UNKNOWN when no wallet is connected', () => {
+    expect(
+      normalizeTransaction(makeRaw({ kind: 'WITHDRAW', direction: undefined }))
+        ?.direction,
+    ).toBe('UNKNOWN');
+    expect(
+      normalizeTransaction(makeRaw({ kind: 'CREATE', direction: undefined }), '')
+        ?.direction,
+    ).toBe('UNKNOWN');
+  });
+
+  it('keeps UNKNOWN when the kind itself is unknown', () => {
+    expect(
+      normalizeTransaction(
+        makeRaw({ kind: 'MYSTERY', direction: undefined }),
+        WALLET,
+      )?.direction,
+    ).toBe('UNKNOWN');
+  });
+
+  it('threads the wallet through normalizeTransactions', () => {
+    const result = normalizeTransactions(
+      [
+        makeRaw({ id: 'withdraw-1', kind: 'WITHDRAW', direction: undefined }),
+        makeRaw({ id: 'create-1', kind: 'CREATE', direction: undefined }),
+      ],
+      WALLET,
+    );
+    expect(result[0]?.direction).toBe('IN');
+    expect(result[1]?.direction).toBe('OUT');
+  });
+
+  it('threads the wallet through the reducer LOAD_SUCCESS action', () => {
+    const state = transactionHistoryReducer(undefined, {
+      type: 'LOAD_SUCCESS',
+      payload: {
+        transactions: [
+          makeRaw({ id: 'withdraw-1', kind: 'WITHDRAW', direction: undefined }),
+          makeRaw({ id: 'create-1', kind: 'CREATE', direction: undefined }),
+        ],
+      },
+      walletAddress: WALLET,
+    });
+    expect(state.transactions[0]?.direction).toBe('IN');
+    expect(state.transactions[1]?.direction).toBe('OUT');
+
+    // An IN direction filter now actually matches derived rows.
+    const filtered = transactionHistoryReducer(state, {
+      type: 'SET_FILTER',
+      filter: { direction: 'IN' },
+    });
+    expect(selectFilteredTransactions(filtered).map((t) => t.id)).toEqual([
+      'withdraw-1',
+    ]);
   });
 });
 
@@ -490,6 +608,82 @@ describe('#136 — selectors', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Consistent ordering across the heap/full-sort switch (#567)
+// ---------------------------------------------------------------------------
+
+describe('#567 — pagination never duplicates or skips rows when timestamps tie', () => {
+  // A single ledger's events are often stamped with the same timestamp, so most
+  // rows share one value. This exercises the equal-timestamp tie-break in BOTH
+  // the bounded heap path (early pages) and the full sort path (deep pages).
+  const n = 2500;
+  const pageSize = 25;
+  const payloadTied = Array.from({ length: n }, (_, i) =>
+    makeRaw({ id: `tx-${i}`, timestamp: Math.floor(i % 37) }),
+  );
+
+  function walkAllPages(state: ReturnType<typeof createInitialTransactionHistoryState>) {
+    const totalPages = selectTotalPages(state);
+    const seen: string[] = [];
+    for (let page = 0; page < totalPages; page++) {
+      const rows = selectVisibleTransactions({ ...state, page });
+      for (const row of rows) seen.push(row.id);
+    }
+    return seen;
+  }
+
+  it('covers every row exactly once across every page', () => {
+    const state = {
+      ...transactionHistoryReducer(undefined, {
+        type: 'LOAD_SUCCESS',
+        payload: payloadTied,
+      }),
+      pageSize,
+    };
+    const seen = walkAllPages(state);
+
+    expect(seen).toHaveLength(n);
+    expect(new Set(seen).size).toBe(n);
+
+    // The intended ordering is "newest first, ties in original row order". A
+    // stable descending sort of the filtered rows (which are in original order)
+    // is that canonical ordering, so the walk must match it exactly —
+    // independent of where the heap/full-sort switch falls.
+    const expected = [...selectFilteredTransactions(state)]
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .map((t) => t.id);
+    expect(seen).toEqual(expected);
+  });
+
+  it('adjacent pages around the half-way switch do not share or drop any row', () => {
+    const state = {
+      ...transactionHistoryReducer(undefined, {
+        type: 'LOAD_SUCCESS',
+        payload: payloadTied,
+      }),
+      pageSize,
+    };
+    // With n=2500 and pageSize=25 the heap branch runs while k < 1250
+    // (pages 0..48) and the full-sort branch from page 49 on. Check every
+    // boundary pair to prove the ordering is continuous.
+    const totalPages = selectTotalPages(state);
+    for (let page = 0; page < totalPages - 1; page++) {
+      const first = selectVisibleTransactions({
+        ...state,
+        page,
+      });
+      const second = selectVisibleTransactions({
+        ...state,
+        page: page + 1,
+      });
+      // The boundary between the two branches must be a clean cut-off of one
+      // continuous ordering — no overlap, and consecutive within the ordering.
+      const overlap = first.filter((f) => second.some((s) => s.id === f.id));
+      expect(overlap).toEqual([]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. Formatters
 // ---------------------------------------------------------------------------
 
@@ -512,6 +706,17 @@ describe('#136 — formatters tolerate undefined input', () => {
     expect(formatAmount('123456789012345')).toBe('12,345,678.9012345');
     expect(formatAmount('-10000000')).toBe('-1');
     expect(formatAmount('123', 0)).toBe('123');
+    expect(formatAmount('15000000', 7)).toBe('1.5');
+  });
+
+  it('formatAmount rejects non-integer stroop strings instead of mis-scaling (#565)', () => {
+    expect(formatAmount('1.5')).toBe('0');
+    expect(formatAmount('1,000')).toBe('0');
+    expect(formatAmount('1e7')).toBe('0');
+    expect(formatAmount('12345678.9')).toBe('0');
+    expect(formatAmount(' 12345678 ')).toBe('1.2345678');
+    expect(formatAmount('-1.5')).toBe('0');
+    expect(formatAmount('--10000000')).toBe('0');
   });
 
   it('formatTimestamp', () => {

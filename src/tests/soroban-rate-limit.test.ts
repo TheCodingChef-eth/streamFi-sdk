@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { RateLimitError } from '../errors.js';
+import { RateLimitError, RpcServiceUnavailableError } from '../errors.js';
 
 const {
   mockSimulateTransaction,
@@ -70,6 +70,20 @@ describe('soroban.ts rate limit handling', () => {
     await expect(promise).rejects.toBeInstanceOf(RateLimitError);
   });
 
+  it('surfaces a 503 as RpcServiceUnavailableError without retrying the same endpoint', async () => {
+    // Regression test for #456: a 503 means the node is down, so the retry
+    // proxy must not backoff-and-retry it like a 429 — it fails fast with a
+    // distinguishable error so callers can fail over to another RPC URL.
+    mockSimulateTransaction.mockRejectedValue({
+      response: { status: 503, headers: {} },
+    });
+
+    await expect(
+      simulateReadOnly('http://localhost:8000', 'passphrase', {} as any)
+    ).rejects.toBeInstanceOf(RpcServiceUnavailableError);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
   it('still throws the original error for non-rate-limit failures', async () => {
     mockSimulateTransaction.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 
@@ -100,7 +114,9 @@ describe('soroban.ts rate limit handling', () => {
     expect(mockGetTransaction).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(200);
-    await expect(promise).rejects.toThrow('Transaction timed out: abc123');
+    // After maxAttempts without a terminal status, invokeContract resolves the
+    // submitted hash as pending rather than throwing a misleading timeout (#509).
+    await expect(promise).resolves.toBe('abc123');
     expect(mockGetTransaction).toHaveBeenCalledTimes(2);
   });
 });

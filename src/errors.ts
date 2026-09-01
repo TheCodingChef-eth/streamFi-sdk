@@ -111,6 +111,20 @@ const MESSAGES_BY_CONTRACT: Record<ConduitContract, Record<number, string>> = {
 export const SUPPORTED_NETWORKS = ['mainnet', 'testnet', 'local'] as const;
 
 /**
+ * Map from CAIP-2 chain identifiers (as used by WalletConnect adapters) to
+ * the canonical SDK network names in {@link SUPPORTED_NETWORKS}. This is the
+ * single source of truth shared by `ConduitClient`'s wallet network check
+ * (`assertWalletNetworkMatch`) and `WalletConnectAdapter`'s construction-time
+ * chain validation, so the two can never silently disagree about which chains
+ * are supported (see #445).
+ */
+export const CAIP2_TO_NETWORK: Readonly<Record<string, string>> = {
+  'stellar:pubnet':  'mainnet',
+  'stellar:testnet': 'testnet',
+  'stellar:local':   'local',
+};
+
+/**
  * Thrown synchronously by `ConduitClient` constructor when an unrecognised
  * network string is supplied — before any RPC connection is attempted.
  *
@@ -147,6 +161,16 @@ export class UnsupportedChainError extends Error {
   }
 }
 
+/**
+ * The root error for any failure that originated from a Conduit smart
+ * contract. The `contract` + `code` pair uniquely identifies the failure,
+ * and `isKnown` tells you whether the SDK recognises the code in its
+ * catalogue for that contract.
+ *
+ * Use {@link isConduitError} when you need a type guard instead of an
+ * `instanceof` check (e.g. across bundle boundaries or when the error may
+ * have been serialized).
+ */
 export class ConduitError extends Error {
   readonly contract: ConduitContract;
   readonly code: number;
@@ -287,6 +311,11 @@ function fromStroopsInternal(stroops: bigint, decimals: number): string {
  * an equivalent JSON-RPC rate-limit error code, instead of the previous
  * generic/unclassified error that made rate limiting indistinguishable
  * from any other network failure. See #120.
+ *
+ * A 429 means the caller is being throttled: back off and retry against
+ * the *same* endpoint. HTTP 503 (Service Unavailable) is a different
+ * failure mode and is reported as {@link RpcServiceUnavailableError} so
+ * consumers can distinguish "throttled" from "endpoint down".
  */
 export class RateLimitError extends Error {
   /** Milliseconds to wait before retrying, parsed from a Retry-After header if present. */
@@ -319,27 +348,41 @@ export class RateLimitError extends Error {
   }
 
   /**
-   * Detects a rate-limit condition from a raw error thrown by the RPC
-   * client and converts it into a typed RateLimitError. Handles two shapes:
+   * Detects a rate-limit or service-unavailable condition from a raw error
+   * thrown by the RPC client and converts it into a typed error. Handles
+   * two shapes:
    *
-   * 1. An axios-style error (network-level 429), shaped like
-   *    `{ response: { status: 429, headers } }`.
+   * 1. An axios-style error (network-level HTTP status), shaped like
+   *    `{ response: { status, headers } }`.
    * 2. A raw JSON-RPC error object (rpc/jsonrpc.js does `throw response.data.error`
    *    directly, so it is a plain object, not an Error instance), shaped
    *    like `{ code: -32029 }`.
    *
-   * Returns null if `raw` is not a rate-limit error, so callers can fall
-   * back to their existing error handling.
+   * HTTP 429 and the equivalent JSON-RPC codes map to a {@link RateLimitError}
+   * (throttled — back off and retry the same endpoint), while HTTP 503 maps
+   * to a {@link RpcServiceUnavailableError} (endpoint down — consider failing
+   * over to a different RPC URL). See #456.
+   *
+   * Returns null if `raw` is neither a rate-limit nor a service-unavailable
+   * error, so callers can fall back to their existing error handling.
    */
-  static fromRpcError(raw: unknown): RateLimitError | null {
+  static fromRpcError(raw: unknown): RateLimitError | RpcServiceUnavailableError | null {
     if (!raw || typeof raw !== 'object') return null;
 
     const response = (raw as { response?: { status?: number; headers?: Record<string, unknown> } }).response;
-    if (response?.status === 429 || response?.status === 503) {
+    if (response?.status === 429) {
       const retryAfterHeader = response.headers?.['retry-after'];
       const retryAfterMs = RateLimitError.parseRetryAfterMs(retryAfterHeader);
       return new RateLimitError(
-        `RPC node rate limit or service unavailable (${response.status}). Back off and retry.`,
+        `RPC node rate limit exceeded (429). Back off and retry against the same endpoint.`,
+        retryAfterMs,
+      );
+    }
+    if (response?.status === 503) {
+      const retryAfterHeader = response.headers?.['retry-after'];
+      const retryAfterMs = RateLimitError.parseRetryAfterMs(retryAfterHeader);
+      return new RpcServiceUnavailableError(
+        `RPC node service unavailable (503). The endpoint may be down; consider failing over to a different RPC URL.`,
         retryAfterMs,
       );
     }
@@ -354,4 +397,126 @@ export class RateLimitError extends Error {
 
     return null;
   }
+}
+
+/**
+ * Thrown when an RPC node responds with HTTP 503 (Service Unavailable).
+ *
+ * Distinct from {@link RateLimitError}: a 429 means the caller is being
+ * throttled and should back off and retry the *same* endpoint, while a 503
+ * usually means the node/endpoint itself is down — the appropriate
+ * remediation is to fail over to a different RPC URL rather than retrying
+ * the same one. Consumers catching `RateLimitError` for backoff-and-retry
+ * therefore never loop forever against a genuinely unavailable service.
+ * See #456.
+ */
+export class RpcServiceUnavailableError extends Error {
+  /** Milliseconds to wait before retrying, parsed from a Retry-After header if present. */
+  readonly retryAfterMs: number | undefined;
+
+  constructor(message: string, retryAfterMs?: number) {
+    super(message);
+    this.name = 'RpcServiceUnavailableError';
+    this.retryAfterMs = retryAfterMs;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ── Indexer timeout ────────────────────────────────────────────────────────────
+
+/**
+ * Thrown when a `GraphQLIndexer.query()` call exceeds its time budget
+ * because the indexer is hung or too slow to respond.  The underlying
+ * `fetch` is aborted via an `AbortController` wired into the timeout.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   const data = await indexer.query({ query: '...' });
+ * } catch (err) {
+ *   if (err instanceof IndexerTimeoutError) {
+ *     console.warn(`Indexer did not respond within ${err.timeoutMs}ms`);
+ *   }
+ * }
+ * ```
+ */
+export class IndexerTimeoutError extends Error {
+  /** The indexer endpoint that timed out. */
+  readonly endpoint: string;
+  /** The timeout window in milliseconds that was exceeded. */
+  readonly timeoutMs: number;
+
+  constructor(endpoint: string, timeoutMs: number) {
+    super(
+      `GraphQL indexer query to ${endpoint} timed out after ${timeoutMs}ms. ` +
+      `The query has been aborted.`,
+    );
+    this.name = 'IndexerTimeoutError';
+    this.endpoint = endpoint;
+    this.timeoutMs = timeoutMs;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ── Operation aborted ─────────────────────────────────────────────────────────
+
+/**
+ * Thrown when an in-flight SDK operation is cancelled by the caller through
+ * an `AbortSignal`. This gives consumers a typed, SDK-native way to
+ * distinguish "the user cancelled" from network, contract, or indexer errors,
+ * instead of relying on the generic DOM `AbortError`.
+ *
+ * @example
+ * ```ts
+ * const controller = new AbortController();
+ * const promise = client.streams.create({ ... }, { signal: controller.signal });
+ * controller.abort();
+ * try { await promise; } catch (err) {
+ *   if (err instanceof OperationAbortedError) {
+    console.log('Cancelled by user:', err.operation);
+   }
+ }
+ ```
+ */
+export class OperationAbortedError extends Error {
+  /** Human-readable name of the operation that was aborted (e.g. "submitBatch"). */
+  readonly operation: string;
+
+  constructor(operation: string) {
+    super(`Operation aborted: ${operation}`);
+    this.name = 'OperationAbortedError';
+    this.operation = operation;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ── Type guard ────────────────────────────────────────────────────────────────
+
+/**
+ * Returns `true` when `value` is a Conduit SDK error instance. Useful in
+ * catch blocks, logging, and transport boundaries where you cannot rely on
+ * `instanceof` across realms or bundled chunks.
+ *
+ * Recognised error classes:
+ * - {@link ConduitError}
+ * - {@link UnsupportedChainError}
+ * - {@link StreamFiNetworkError}
+ * - {@link InsufficientBalanceError}
+ * - {@link RateLimitError}
+ * - {@link RpcServiceUnavailableError}
+ * - {@link IndexerTimeoutError}
+ * - {@link OperationAbortedError}
+ */
+export function isConduitError(value: unknown): value is Error {
+  if (!(value instanceof Error)) return false;
+  return [
+    'ConduitError',
+    'UnsupportedChainError',
+    'StreamFiNetworkError',
+    'InsufficientBalanceError',
+    'RateLimitError',
+    'RpcServiceUnavailableError',
+    'IndexerTimeoutError',
+    'OperationAbortedError',
+  ].includes(value.name);
 }

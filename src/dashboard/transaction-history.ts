@@ -105,7 +105,16 @@ export interface TransactionHistoryState {
 
 export type TransactionHistoryAction =
   | { type: 'LOAD_START' }
-  | { type: 'LOAD_SUCCESS'; payload: unknown; receivedAt?: number }
+  | {
+      type: 'LOAD_SUCCESS';
+      payload: unknown;
+      receivedAt?: number;
+      /**
+       * Address of the connected wallet. Used to derive the viewer-relative
+       * `direction` of each row, since most indexers never emit one.
+       */
+      walletAddress?: string;
+    }
   | { type: 'LOAD_FAILURE'; error: unknown }
   | { type: 'SET_FILTER'; filter: Partial<TransactionFilters> }
   | { type: 'SET_PAGE'; page: unknown }
@@ -204,7 +213,21 @@ function toIso8601(value: string): string {
 function asTimestamp(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     // Indexers emit seconds for `createdAt`; normalise to milliseconds.
-    return value < 1e12 ? Math.trunc(value) * 1000 : Math.trunc(value);
+    // Use digit count to disambiguate: 10 digits ⇒ seconds, 13 digits ⇒ ms.
+    // This avoids the pre-2001 ms misclassification of the old < 1e12 check.
+    const abs = Math.abs(value);
+    if (abs >= 1e9 && abs < 1e10) {
+      // 10 digits: seconds epoch (1970–2033 range)
+      return Math.trunc(value) * 1000;
+    }
+    if (abs >= 1e12 && abs < 1e13) {
+      // 13 digits: milliseconds epoch
+      return Math.trunc(value);
+    }
+    // Ambiguous digit count (e.g. 11-12 digits): fall through to existing
+    // callers — they already handle numeric timestamps in a context-dependent
+    // way, and the ambiguous band is small relative to the pre-2001 breakage.
+    return Math.trunc(value);
   }
   if (typeof value === 'string' && value.trim() !== '') {
     const trimmed = value.trim();
@@ -245,6 +268,42 @@ export function toErrorMessage(
 }
 
 // ---------------------------------------------------------------------------
+// Direction derivation
+// ---------------------------------------------------------------------------
+
+/**
+ * Derives the viewer-relative value direction from the transaction kind when
+ * the indexer does not emit an explicit `direction` (most don't — direction
+ * depends on which wallet is viewing the row, so it is not a property of the
+ * on-chain event).
+ *
+ * The connected wallet is threaded in so we only guess when it actually
+ * participates in the row, mirroring the ISSUE-566 guidance:
+ *
+ * - `WITHDRAW` — the wallet is the recipient → money flows **IN**.
+ * - `CREATE` / `TOP_UP` — the wallet is the sender → money flows **OUT**.
+ * - anything else (`PAUSE`, `RESUME`, `CANCEL`, `UNKNOWN`, …) → `UNKNOWN`.
+ *
+ * Returns `UNKNOWN` when there is no wallet (nothing to derive against) or
+ * when the kind carries no directional meaning.
+ */
+function deriveTransactionDirection(
+  kind: TransactionKind,
+  walletAddress: string,
+): TransactionDirection {
+  if (walletAddress.trim() === '') return 'UNKNOWN';
+  switch (kind) {
+    case 'WITHDRAW':
+      return 'IN';
+    case 'CREATE':
+    case 'TOP_UP':
+      return 'OUT';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Normalisation
 // ---------------------------------------------------------------------------
 
@@ -252,42 +311,73 @@ export function toErrorMessage(
  * Turns one raw indexer record into a fully-populated `TransactionRecord`.
  * Returns `null` for values that cannot possibly be a record (`null`,
  * primitives, arrays) so the caller can drop them.
+ *
+ * An explicit indexer `direction` is trusted when present; otherwise the
+ * `direction` is derived from the transaction `kind` relative to the connected
+ * `walletAddress` (see `deriveTransactionDirection`), falling back to
+ * `UNKNOWN`.
  */
-export function normalizeTransaction(raw: unknown): TransactionRecord | null {
+export function normalizeTransaction(
+  raw: unknown,
+  walletAddress?: string,
+): TransactionRecord | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
 
   const record = raw as Record<string, unknown>;
 
-  const id = asString(record['id'] ?? record['hash'] ?? record['streamId']);
+  const id = asString(record['id'] ?? record['hash']);
   const hash = asString(record['hash'] ?? record['txHash'] ?? record['id']);
+  const streamId = asString(record['streamId'] ?? record['stream_id']);
 
   // A record with no identity at all is unusable — drop it rather than
   // rendering a row with an empty React key.
-  if (id === '' && hash === '') return null;
+  if (id === '' && hash === '' && streamId === '') return null;
 
-  const amountRaw = record['amount'] ?? record['value'] ?? record['ratePerSecond'];
+  const amountRaw = record['amount'] ?? record['value'];
+  const kind = asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN');
+  const explicitDirection = asEnum(
+    record['direction'],
+    VALID_DIRECTIONS,
+    'UNKNOWN',
+  );
+
+  const timestamp = asTimestamp(record['timestamp'] ?? record['createdAt']);
+  // When neither id nor hash is present, synthesise a composite key so
+  // distinct events on the same stream aren't treated as duplicates.
+  const synthesizedId =
+    id !== '' ? id : hash !== '' ? hash : `${streamId}:${kind}:${timestamp}`;
 
   return {
-    id: id === '' ? hash : id,
+    id: synthesizedId,
     hash,
     streamId: asString(record['streamId'] ?? record['stream_id']),
-    kind: asEnum(record['kind'] ?? record['type'], VALID_KINDS, 'UNKNOWN'),
-    direction: asEnum(record['direction'], VALID_DIRECTIONS, 'UNKNOWN'),
+    kind,
+    direction:
+      explicitDirection !== 'UNKNOWN'
+        ? explicitDirection
+        : deriveTransactionDirection(kind, asString(walletAddress)),
     status: asEnum(record['status'], VALID_STATUSES, 'UNKNOWN'),
     amount: asString(amountRaw, '0'),
     asset: asString(record['asset'] ?? record['token'] ?? record['symbol'], 'XLM'),
     counterparty: asString(
       record['counterparty'] ?? record['recipient'] ?? record['sender'],
     ),
-    timestamp: asTimestamp(record['timestamp'] ?? record['createdAt']),
+    timestamp,
   };
 }
 
 /**
  * Normalises a whole payload. Accepts the raw GraphQL `data` object, a bare
  * array, `null`, `undefined` or garbage — and always returns an array.
+ *
+ * When a `walletAddress` is provided it is forwarded to each row's
+ * `normalizeTransaction` so viewer-relative `direction` can be derived for
+ * indexers that do not emit it.
  */
-export function normalizeTransactions(payload: unknown): TransactionRecord[] {
+export function normalizeTransactions(
+  payload: unknown,
+  walletAddress?: string,
+): TransactionRecord[] {
   let list: unknown = payload;
 
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -314,7 +404,7 @@ export function normalizeTransactions(payload: unknown): TransactionRecord[] {
   const normalized: TransactionRecord[] = [];
 
   for (const entry of list) {
-    const record = normalizeTransaction(entry);
+    const record = normalizeTransaction(entry, walletAddress);
     if (record === null) continue;
     // De-duplicate on id so a refetch racing a poll cannot produce duplicate
     // React keys.
@@ -361,7 +451,10 @@ export function transactionHistoryReducer(
       return { ...current, loading: true, error: null };
 
     case 'LOAD_SUCCESS': {
-      const transactions = normalizeTransactions(action.payload);
+      const transactions = normalizeTransactions(
+        action.payload,
+        action.walletAddress,
+      );
       const totalPages = Math.max(
         1,
         Math.ceil(transactions.length / Math.max(1, current.pageSize)),
@@ -590,11 +683,14 @@ export function selectVisibleTransactions(
   const page = clampPage(state?.page ?? 0, totalPages);
   const start = page * pageSize;
 
+  // Always use the same ordering (`topKByTimestampDesc`, which tie-breaks
+  // equal timestamps on the original index via `isLowerPriority`) so that
+  // paging through a dataset that shares timestamps never changes order
+  // part-way and duplicates/skips rows across the page boundary (#567).
+  // The function is O(n log k) and degrades to a full sort for deep pages,
+  // so there is no cost to using it uniformly.
   const k = start + pageSize;
-  const top =
-    k < filtered.length * 0.5
-      ? topKByTimestampDesc(filtered, k)
-      : [...filtered].sort((a, b) => b.timestamp - a.timestamp);
+  const top = topKByTimestampDesc(filtered, k);
   return top.slice(start, start + pageSize);
 }
 
@@ -637,21 +733,35 @@ export function formatAddress(address: unknown, visible = 6): string {
   return `${value.slice(0, head)}…${value.slice(-4)}`;
 }
 
-/** Stroops → decimal string. Falls back to `'0'` on unparseable input. */
+/**
+ * Stroops → decimal string. Falls back to `'0'` on unparseable input.
+ *
+ * `raw` must be a strict integer string (`/^-?\d+$/`) — fractional values
+ * (`"1.5"`), grouped values (`"1,000"`), or any other non-digit characters
+ * are rejected rather than stripped, since silently discarding a `.` or `,`
+ * would mis-scale the amount instead of failing loudly.
+ */
 export function formatAmount(amount: unknown, decimals = 7): string {
   const raw = asString(amount, '0').trim();
+  if (!/^-?\d+$/.test(raw)) return '0';
+
   const negative = raw.startsWith('-');
-  const digits = (negative ? raw.slice(1) : raw).replace(/[^0-9]/g, '');
+  const digits = negative ? raw.slice(1) : raw;
   if (digits === '') return '0';
 
-  const places = Math.max(0, Math.trunc(decimals));
+  const places = Number.isFinite(decimals) ? Math.max(0, Math.trunc(decimals)) : 7;
   const padded = digits.padStart(places + 1, '0');
-  const whole = padded.slice(0, padded.length - places) || '0';
+  // Strip leading zeros from the integer part (keep one) so a long all-zero
+  // input like '00000000000' does not group into '0,000' (#618).
+  const whole = (padded.slice(0, padded.length - places) || '0').replace(/^0+(?=\d)/, '');
   const fraction = places === 0 ? '' : padded.slice(padded.length - places);
   const trimmedFraction = fraction.replace(/0+$/, '');
 
   const formattedWhole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  const sign = negative ? '-' : '';
+  // Never emit a signed zero ("-0"): a negative stroop value that scales to
+  // nothing is just zero (#618).
+  const isZero = formattedWhole === '0' && trimmedFraction === '';
+  const sign = negative && !isZero ? '-' : '';
 
   return trimmedFraction === ''
     ? `${sign}${formattedWhole}`

@@ -42,6 +42,7 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     delete (globalThis as any).WebSocket;
   });
 
@@ -61,7 +62,7 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     indexer.cleanup();
   });
 
-  it('sends connection_init then subscribe with the query and variables on open', () => {
+  it('sends connection_init on open and defers subscribe until connection_ack', () => {
     const indexer = new GraphQLIndexer(endpoint);
     indexer.subscribe({
       query: 'subscription { streamUpdated { id } }',
@@ -72,8 +73,13 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     mockWs.readyState = 1;
     mockWs.onopen!();
 
-    expect(mockWs.sent).toHaveLength(2);
+    // Only connection_init until the server acks.
+    expect(mockWs.sent).toHaveLength(1);
     expect(JSON.parse(mockWs.sent[0]!)).toEqual({ type: 'connection_init' });
+
+    mockWs.onmessage!({ data: JSON.stringify({ type: 'connection_ack' }) });
+
+    expect(mockWs.sent).toHaveLength(2);
     const subscribeMsg = JSON.parse(mockWs.sent[1]!);
     expect(subscribeMsg.type).toBe('subscribe');
     expect(subscribeMsg.payload).toEqual({
@@ -167,14 +173,204 @@ describe('GraphQLIndexer.subscribe() — WebSocket transport', () => {
     expect(mockWs.close).toHaveBeenCalledTimes(1);
   });
 
-  it('auto-unsubscribes when the socket closes unexpectedly', () => {
+  it('notifies onError and keeps the subscription active on unexpected close', () => {
+    const onError = vi.fn();
     const indexer = new GraphQLIndexer(endpoint);
-    indexer.subscribe({ query: 'subscription { x }', onData: () => {} });
+    indexer.subscribe({
+      query: 'subscription { x }',
+      onData: () => {},
+      onError,
+      maxReconnectAttempts: 5,
+      reconnectDelayMs: 1000,
+    });
     expect(indexer.getSubscriptionCount()).toBe(1);
 
     mockWs.onclose!();
 
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining(endpoint) }),
+    );
+    expect(indexer.getSubscriptionCount()).toBe(1);
+    indexer.cleanup();
+  });
+
+  it('reconnects and resends connection_init plus subscribe after unexpected close', () => {
+    vi.useFakeTimers();
+    const sockets: Array<ReturnType<typeof createMockWs>> = [];
+    wsCtor.mockImplementation(function () {
+      const socket = createMockWs();
+      sockets.push(socket);
+      return socket;
+    });
+
+    const indexer = new GraphQLIndexer(endpoint);
+    indexer.subscribe({
+      query: 'subscription { streamUpdated { id } }',
+      variables: { streamId: '1' },
+      onData: () => {},
+      onError: () => {},
+      maxReconnectAttempts: 3,
+      reconnectDelayMs: 10,
+    });
+
+    expect(sockets).toHaveLength(1);
+    sockets[0]!.onclose!();
+
+    vi.advanceTimersByTime(10);
+    expect(sockets).toHaveLength(2);
+
+    sockets[1]!.readyState = 1;
+    sockets[1]!.onopen!();
+
+    expect(sockets[1]!.sent).toHaveLength(1);
+    expect(JSON.parse(sockets[1]!.sent[0]!)).toEqual({ type: 'connection_init' });
+
+    sockets[1]!.onmessage!({ data: JSON.stringify({ type: 'connection_ack' }) });
+
+    expect(sockets[1]!.sent).toHaveLength(2);
+    expect(JSON.parse(sockets[1]!.sent[1]!)).toMatchObject({
+      type: 'subscribe',
+      payload: {
+        query: 'subscription { streamUpdated { id } }',
+        variables: { streamId: '1' },
+      },
+    });
+
+    indexer.cleanup();
+    vi.useRealTimers();
+  });
+
+  it('does not reconnect after unsubscribe during the backoff window', () => {
+    vi.useFakeTimers();
+    const sockets: Array<ReturnType<typeof createMockWs>> = [];
+    wsCtor.mockImplementation(function () {
+      const socket = createMockWs();
+      sockets.push(socket);
+      return socket;
+    });
+
+    const indexer = new GraphQLIndexer(endpoint);
+    const sub = indexer.subscribe({
+      query: 'subscription { x }',
+      onData: () => {},
+      onError: () => {},
+      maxReconnectAttempts: 3,
+      reconnectDelayMs: 10,
+    });
+
+    sockets[0]!.onclose!();
+    sub.unsubscribe();
+    vi.advanceTimersByTime(1000);
+
+    expect(sockets).toHaveLength(1);
     expect(indexer.getSubscriptionCount()).toBe(0);
+    indexer.cleanup();
+    vi.useRealTimers();
+  });
+
+  it('does not reconnect after cleanup during the backoff window', () => {
+    vi.useFakeTimers();
+    const sockets: Array<ReturnType<typeof createMockWs>> = [];
+    wsCtor.mockImplementation(function () {
+      const socket = createMockWs();
+      sockets.push(socket);
+      return socket;
+    });
+
+    const indexer = new GraphQLIndexer(endpoint);
+    indexer.subscribe({
+      query: 'subscription { x }',
+      onData: () => {},
+      onError: () => {},
+      maxReconnectAttempts: 3,
+      reconnectDelayMs: 10,
+    });
+
+    sockets[0]!.onclose!();
+    indexer.cleanup();
+    vi.advanceTimersByTime(1000);
+
+    expect(sockets).toHaveLength(1);
+    expect(indexer.getSubscriptionCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('tears down after reconnect attempts are exhausted', () => {
+    vi.useFakeTimers();
+    const sockets: Array<ReturnType<typeof createMockWs>> = [];
+    wsCtor.mockImplementation(function () {
+      const socket = createMockWs();
+      sockets.push(socket);
+      return socket;
+    });
+
+    const onError = vi.fn();
+    const indexer = new GraphQLIndexer(endpoint);
+    indexer.subscribe({
+      query: 'subscription { x }',
+      onData: () => {},
+      onError,
+      maxReconnectAttempts: 2,
+      reconnectDelayMs: 10,
+    });
+
+    sockets[0]!.onclose!();
+    vi.advanceTimersByTime(10);
+    expect(sockets).toHaveLength(2);
+
+    sockets[1]!.onclose!();
+    vi.advanceTimersByTime(20);
+    expect(sockets).toHaveLength(3);
+
+    sockets[2]!.onclose!();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringMatching(/exhausted/i) }),
+    );
+    expect(indexer.getSubscriptionCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('rejects out-of-range reconnect options before opening a socket', () => {
+    const indexer = new GraphQLIndexer(endpoint);
+
+    expect(() =>
+      indexer.subscribe({
+        query: 'subscription { x }',
+        onData: () => {},
+        maxReconnectAttempts: 33,
+      }),
+    ).toThrow(/maxReconnectAttempts/);
+
+    expect(() =>
+      indexer.subscribe({
+        query: 'subscription { x }',
+        onData: () => {},
+        reconnectDelayMs: -1,
+      }),
+    ).toThrow(/reconnectDelayMs/);
+
+    expect(wsCtor).not.toHaveBeenCalled();
+    indexer.cleanup();
+  });
+
+  it('tears down immediately when maxReconnectAttempts is 0', () => {
+    const onError = vi.fn();
+    const indexer = new GraphQLIndexer(endpoint);
+    indexer.subscribe({
+      query: 'subscription { x }',
+      onData: () => {},
+      onError,
+      maxReconnectAttempts: 0,
+      reconnectDelayMs: 10,
+    });
+
+    mockWs.onclose!();
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringMatching(/exhausted/i) }),
+    );
+    expect(indexer.getSubscriptionCount()).toBe(0);
+    expect(wsCtor).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -5,6 +5,7 @@ import {
   calculateRate,
   calculateYield,
   streamProgress,
+  normalizeProgress,
   withdrawableLocal,
   bigintSafeStringify,
   isValidAddress,
@@ -198,6 +199,24 @@ describe('streamProgress', () => {
   });
 });
 
+// ── normalizeProgress ────────────────────────────────────────────────────────
+// Module36 and Module48 both need to turn streamProgress()'s NaN
+// (open-ended, already-started) result into a defined midpoint value.
+// This must be a single shared helper — see #482 — not two independent
+// reimplementations that can drift out of sync at the edges.
+
+describe('normalizeProgress', () => {
+  it('maps NaN to the midpoint 0.5', () => {
+    expect(normalizeProgress(Number.NaN)).toBe(0.5);
+  });
+
+  it('passes finite values through unchanged', () => {
+    expect(normalizeProgress(0)).toBe(0);
+    expect(normalizeProgress(1)).toBe(1);
+    expect(normalizeProgress(0.25)).toBe(0.25);
+  });
+});
+
 // ── withdrawableLocal ────────────────────────────────────────────────────────
 
 describe('withdrawableLocal', () => {
@@ -252,6 +271,34 @@ describe('withdrawableLocal', () => {
     const rate = 100n;
     const s    = makeStream({ ratePerSecond: rate, startTime: now - 1000, withdrawn: 50_000n });
     expect(withdrawableLocal(s, now)).toBe(rate * 1000n - 50_000n);
+  });
+
+  it('a stream paused *after* end_time has fully streamed (matches on-chain clamp order)', () => {
+    const now  = Math.floor(Date.now() / 1000);
+    const rate = 100n;
+    // start .. end (1000s of streaming) .. then paused, then now
+    const s = makeStream({
+      ratePerSecond: rate,
+      startTime:     now - 3000,
+      endTime:       now - 2000,
+      paused:        true,
+      pausedAt:      now - 500, // pause began well after the stream ended
+    });
+    // end_time wins: rate × (endTime − startTime) = 100 × 1000
+    expect(withdrawableLocal(s, now)).toBe(rate * 1000n);
+  });
+
+  it('a pause that began before end_time still freezes accrual', () => {
+    const now  = Math.floor(Date.now() / 1000);
+    const rate = 100n;
+    const s = makeStream({
+      ratePerSecond: rate,
+      startTime:     now - 1000,
+      endTime:       now + 1000,
+      paused:        true,
+      pausedAt:      now - 400, // pause began while still running
+    });
+    expect(withdrawableLocal(s, now)).toBe(rate * 600n);
   });
 });
 
@@ -468,6 +515,11 @@ describe('isValidAddress', () => {
   it('returns false for non-string input', () => {
     expect(isValidAddress(null as unknown as string)).toBe(false);
     expect(isValidAddress(undefined as unknown as string)).toBe(false);
+  });
+
+  it('returns true for a valid Soroban contract address (C...) (#512)', () => {
+    const contractId = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+    expect(isValidAddress(contractId)).toBe(true);
   });
 
   it('returns false for a random unrelated string', () => {

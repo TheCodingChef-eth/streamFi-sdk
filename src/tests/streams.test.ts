@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Keypair, xdr } from '@stellar/stellar-sdk';
 import { ConduitError, StreamErrorCode } from '../errors.js';
+import {
+  STREAM_FLAG_PAUSED,
+  STREAM_FLAG_CANCELLED,
+  STREAM_FLAG_CLAWBACK_ENABLED,
+} from '../constants.js';
 import type { ConduitConfig } from '../types/index.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -114,6 +119,75 @@ describe('StreamsModule — keypair guard', () => {
     const sdk = new StreamsModule(makeConfig(false));
     await expect(sdk.clawback(1n)).rejects.toThrow('keypair');
   });
+
+  it('forceCancel() throws without keypair', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    await expect(sdk.forceCancel(1n)).rejects.toThrow('keypair');
+  });
+
+  it('transferRecipient() throws without keypair', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    await expect(sdk.transferRecipient(1n, 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5')).rejects.toThrow('keypair');
+  });
+});
+
+describe('StreamsModule — amount validation (withdraw/topUp)', () => {
+  it('withdraw() rejects an explicit zero amount client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.withdraw(1n, 0n)).rejects.toThrow('Invalid amount: must be greater than zero');
+  });
+
+  it('withdraw() rejects a negative amount client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.withdraw(1n, -5n)).rejects.toThrow('Invalid amount: must be greater than zero');
+  });
+
+  it('topUp() rejects a zero amount client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.topUp(1n, 0n)).rejects.toThrow('Invalid amount: must be greater than zero');
+  });
+
+  it('topUp() rejects a negative amount client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.topUp(1n, -1n)).rejects.toThrow('Invalid amount: must be greater than zero');
+  });
+
+  it('topUpStream() rejects a zero amount client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.topUpStream('1', '0')).rejects.toThrow('Invalid amount: must be greater than zero');
+  });
+
+  it('batchWithdraw() reports an invalid amount as a per-item failure', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    const result = await sdk.batchWithdraw([{ streamId: 1n, amount: 0n }]);
+    expect(result).toEqual([{
+      streamId: 1n,
+      success: false,
+      error: 'Invalid amount: must be greater than zero',
+    }]);
+  });
+});
+
+describe('StreamsModule — transferRecipient() validation', () => {
+  it('rejects an empty recipient address client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.transferRecipient(1n, '')).rejects.toThrow('Invalid recipient address: must be a non-empty string');
+  });
+
+  it('rejects a whitespace-only recipient address client-side', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(true));
+    await expect(sdk.transferRecipient(1n, '   ')).rejects.toThrow('Invalid recipient address: must be a non-empty string');
+  });
 });
 
 describe('StreamsModule — create() param validation', () => {
@@ -142,6 +216,78 @@ describe('StreamsModule — _resolveAddr via get()', () => {
     expect(err).toBeInstanceOf(ConduitError);
     expect((err as ConduitError).contract).toBe('stream');
     expect((err as ConduitError).code).toBe(StreamErrorCode.StreamNotFound);
+  });
+});
+
+describe('StreamsModule — get() flag decoding', () => {
+  const STREAM_ADDR = 'CBQHNAXSI55GX2GN6D67GK7BHVPSLJUGZQEU7WJ5LKR5PNUCGLIMAO4K';
+
+  const scvMap = (entries: Record<string, xdr.ScVal>): xdr.ScVal =>
+    xdr.ScVal.scvMap(
+      Object.entries(entries).map(
+        ([k, v]) => new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol(k), val: v }),
+      ),
+    );
+  const u32 = (n: number) => xdr.ScVal.scvU32(n);
+  const u64 = (n: bigint) => xdr.ScVal.scvU64(xdr.Uint64.fromString(n.toString()));
+
+  const infoWith = (flags: number, pausedAt = 0n): xdr.ScVal =>
+    scvMap({ flags: u32(flags), paused_at: u64(pausedAt) });
+
+  beforeEach(() => {
+    mockStreamAddress.mockReset().mockResolvedValue(STREAM_ADDR);
+    mockSimulate.mockReset();
+  });
+
+  async function getInfo(retval: xdr.ScVal) {
+    mockSimulate.mockResolvedValue({ result: { retval } });
+    const { StreamsModule } = await import('../streams.js');
+    return new StreamsModule(makeConfig(false)).get(1n);
+  }
+
+  it('reports every flag false when flags = 0', async () => {
+    const info = await getInfo(infoWith(0));
+    expect(info.paused).toBe(false);
+    expect(info.cancelled).toBe(false);
+    expect(info.clawbackEnabled).toBe(false);
+  });
+
+  it('decodes FLAG_PAUSED (bit 0)', async () => {
+    const info = await getInfo(infoWith(STREAM_FLAG_PAUSED, 1_700_000_000n));
+    expect(info.paused).toBe(true);
+    expect(info.pausedAt).toBe(1_700_000_000);
+    expect(info.cancelled).toBe(false);
+    expect(info.clawbackEnabled).toBe(false);
+  });
+
+  it('decodes FLAG_CLAWBACK_ENABLED (bit 1)', async () => {
+    const info = await getInfo(infoWith(STREAM_FLAG_CLAWBACK_ENABLED));
+    expect(info.clawbackEnabled).toBe(true);
+    expect(info.paused).toBe(false);
+    expect(info.cancelled).toBe(false);
+  });
+
+  it('decodes FLAG_CANCELLED (bit 2)', async () => {
+    const info = await getInfo(infoWith(STREAM_FLAG_CANCELLED));
+    expect(info.cancelled).toBe(true);
+    expect(info.paused).toBe(false);
+    expect(info.clawbackEnabled).toBe(false);
+  });
+
+  it('decodes several flags packed together', async () => {
+    const info = await getInfo(
+      infoWith(STREAM_FLAG_PAUSED | STREAM_FLAG_CANCELLED | STREAM_FLAG_CLAWBACK_ENABLED),
+    );
+    expect(info.paused).toBe(true);
+    expect(info.cancelled).toBe(true);
+    expect(info.clawbackEnabled).toBe(true);
+  });
+
+  it('defaults every flag to false when the contract omits `flags`', async () => {
+    const info = await getInfo(scvMap({ paused_at: u64(0n) }));
+    expect(info.paused).toBe(false);
+    expect(info.cancelled).toBe(false);
+    expect(info.clawbackEnabled).toBe(false);
   });
 });
 
@@ -252,6 +398,66 @@ describe('StreamsModule — list()', () => {
     expect(result.totalCount).toBe(21n);
     expect(mockStreamCount).not.toHaveBeenCalled();
   });
+
+  it('queries both sender and recipient filters when both are given, merging from offset 0 (#507)', async () => {
+    mockStreamsBySender.mockResolvedValue([]);
+    mockStreamsByRecipient.mockResolvedValue([]);
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    await sdk.list({
+      sender:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+      recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      offset: 5,
+      limit: 10,
+    });
+    // Both sub-indices are fetched from offset 0 through offset+limit so
+    // they can be merged into one honest, ordered window before slicing
+    // out this page — see #507.
+    expect(mockStreamsBySender).toHaveBeenCalledWith(
+      'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN', 0, 16,
+    );
+    expect(mockStreamsByRecipient).toHaveBeenCalledWith(
+      'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5', 0, 16,
+    );
+  });
+
+  it('returns the de-duplicated union when both sender and recipient are given', async () => {
+    mockStreamsBySender.mockResolvedValue([1n, 2n]);
+    mockStreamsByRecipient.mockResolvedValue([2n, 3n]);
+    mockStreamAddress.mockResolvedValue('CCWAMYJME27OHTPKVSV252YRPXEO4BSKBHVLQ7ML3OWYNMB5RQEVHSM');
+    mockSimulate.mockResolvedValue({ result: { retval: xdr.ScVal.scvMap([]) } });
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    const result = await sdk.list({
+      sender:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+      recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      offset: 0,
+      limit: 20,
+    });
+    // Stream 2 appears in both pages and must not be duplicated.
+    expect(result.streams.map(s => s.id)).toEqual([1n, 2n, 3n]);
+    expect(result.hasNextPage).toBe(false);
+  });
+
+  it('caps the union page at `limit` and reports hasNextPage honestly (#507)', async () => {
+    // 5 sender streams + 5 disjoint recipient streams = 10 total, but the
+    // caller only asked for a page of 3.
+    mockStreamsBySender.mockResolvedValue([1n, 2n, 3n, 4n, 5n]);
+    mockStreamsByRecipient.mockResolvedValue([6n, 7n, 8n, 9n, 10n]);
+    mockStreamAddress.mockResolvedValue('CCWAMYJME27OHTPKVSV252YRPXEO4BSKBHVLQ7ML3OWYNMB5RQEVHSM');
+    mockSimulate.mockResolvedValue({ result: { retval: xdr.ScVal.scvMap([]) } });
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    const result = await sdk.list({
+      sender:    'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+      recipient: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      offset: 0,
+      limit: 3,
+    });
+    expect(result.streams).toHaveLength(3);
+    expect(result.streams.map(s => s.id)).toEqual([1n, 2n, 3n]);
+    expect(result.hasNextPage).toBe(true);
+  });
 });
 
 describe('StreamsModule — subscribe()', () => {
@@ -297,11 +503,40 @@ describe('StreamsModule — subscribe()', () => {
 });
 
 describe('StreamsModule — subscribeAsync()', () => {
+  const STREAM_ADDR = 'CBQHNAXSI55GX2GN6D67GK7BHVPSLJUGZQEU7WJ5LKR5PNUCGLIMAO4K';
+
   it('throws when stream address is not found', async () => {
     mockStreamAddress.mockResolvedValue(null);
     const { StreamsModule } = await import('../streams.js');
     const sdk = new StreamsModule(makeConfig(false));
     await expect(sdk.subscribeAsync(42n, {})).rejects.toThrow('not found');
+  });
+
+  it('passes the resolved rpcUrl (network default) to subscribeToStream, never undefined', async () => {
+    mockStreamAddress.mockResolvedValue(STREAM_ADDR);
+    const { subscribeToStream } = await import('../events.js');
+    const spy = vi.mocked(subscribeToStream);
+    spy.mockClear();
+
+    const { StreamsModule } = await import('../streams.js');
+    // makeConfig() sets no rpcUrl → constructor falls back to DEFAULT_RPC.testnet
+    await new StreamsModule(makeConfig(false)).subscribeAsync(1n, {});
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]![0]).toBe('https://soroban-testnet.stellar.org');
+  });
+
+  it('honours an explicit rpcUrl override', async () => {
+    mockStreamAddress.mockResolvedValue(STREAM_ADDR);
+    const { subscribeToStream } = await import('../events.js');
+    const spy = vi.mocked(subscribeToStream);
+    spy.mockClear();
+
+    const { StreamsModule } = await import('../streams.js');
+    await new StreamsModule({ ...makeConfig(false), rpcUrl: 'https://my-node.example' })
+      .subscribeAsync(1n, {});
+
+    expect(spy.mock.calls[0]![0]).toBe('https://my-node.example');
   });
 });
 
@@ -337,5 +572,40 @@ describe('StreamsModule — server caching', () => {
     const server1 = (sdk as any)._server();
     const server2 = (sdk as any)._server();
     expect(server1).toBe(server2);
+  });
+});
+
+describe('StreamsModule.getStreamInfos', () => {
+  it('returns results and failures for a mixed fan-out', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+
+    const goodInfo = { id: 1n, address: 'C_GOOD' } as unknown as import('../types/index.js').StreamInfo;
+    vi.spyOn(sdk, 'get').mockImplementation(async (id) => {
+      if (id === 1n || id === '1') return goodInfo;
+      throw new Error('not found');
+    });
+
+    const result = await sdk.getStreamInfos([1n, 2n, '3'], { maxConcurrency: 2 });
+
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]).toBe(goodInfo);
+    expect(result.failures).toHaveLength(2);
+    expect(result.failures.map(f => ({ id: f.id, error: f.error }))).toEqual([
+      { id: 2n, error: 'not found' },
+      { id: 3n, error: 'not found' },
+    ]);
+  });
+
+  it('preserves input order', async () => {
+    const { StreamsModule } = await import('../streams.js');
+    const sdk = new StreamsModule(makeConfig(false));
+    vi.spyOn(sdk, 'get').mockImplementation(async (id) => ({
+      id: BigInt(id),
+      address: 'C_' + String(id),
+    } as unknown as import('../types/index.js').StreamInfo));
+
+    const result = await sdk.getStreamInfos([5n, 4n, 3n]);
+    expect(result.results.map(i => i.id)).toEqual([5n, 4n, 3n]);
   });
 });

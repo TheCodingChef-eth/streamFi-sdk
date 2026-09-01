@@ -1,10 +1,16 @@
 const { execFileSync } = require('node:child_process');
-const { existsSync, writeFileSync } = require('node:fs');
-const { basename, resolve } = require('node:path');
+const { existsSync, writeFileSync, cpSync } = require('node:fs');
+const { basename, resolve, join } = require('node:path');
 
-// A maintained, general-purpose Next.js starter. Projects can provide a StreamFi
-// specific fork with --template as soon as one is available.
-const DEFAULT_TEMPLATE = 'https://github.com/ixartz/Next-js-Boilerplate.git';
+// Bundled, StreamFi-wired Next.js template (a copy of examples/nextjs-app),
+// used by default. Pass --template <name|url> to pick a different starter
+// (next-app, node-script, cron-worker) or clone an external git repository.
+const BUNDLED_TEMPLATE_DIR = join(__dirname, '..', 'template');
+const TEMPLATES_DIR = join(__dirname, '..', 'templates');
+// null means "use the bundled template"; parseArguments() only replaces this
+// with a name/URL when the caller explicitly passes --template.
+const DEFAULT_TEMPLATE = null;
+const BUILT_IN_TEMPLATES = ['next-app', 'node-script', 'cron-worker'];
 const SDK_PACKAGE = '@conduit-protocol/sdk';
 
 function parseArguments(args) {
@@ -16,7 +22,7 @@ function parseArguments(args) {
     else if (argument === '--skip-install') options.skipInstall = true;
     else if (argument === '--template') {
       options.template = args[++index];
-      if (!options.template) throw new Error('--template requires a repository URL');
+      if (!options.template) throw new Error('--template requires a template name or repository URL');
     } else if (argument.startsWith('-')) throw new Error(`Unknown option: ${argument}`);
     else if (options.projectName) throw new Error('Only one project name may be provided');
     else options.projectName = argument;
@@ -28,34 +34,90 @@ function parseArguments(args) {
   return options;
 }
 
-function testnetEnv() {
-  return `# StreamFi / Stellar testnet\nNEXT_PUBLIC_STELLAR_NETWORK=testnet\nNEXT_PUBLIC_STELLAR_RPC_URL=https://soroban-testnet.stellar.org\nNEXT_PUBLIC_STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org\n`;
+// Matches the env vars examples/nextjs-app (and the bundled template, which
+// is a copy of it) actually read — see lib/conduit.ts. Values that can't be
+// known ahead of time are left blank with a comment rather than guessed.
+function testnetEnv(template) {
+  if (template === 'node-script' || template === 'cron-worker') {
+    return `# StreamFi / Stellar testnet
+STREAM_NETWORK=testnet
+
+# Deployed DripFactory contract ID for the chosen network.
+FACTORY_ADDRESS=
+
+# Secret key for signing transactions.
+STELLAR_SECRET=
+${template === 'cron-worker' ? '
+# Recipient address to watch for auto-withdrawals.
+RECIPIENT_ADDRESS=
+' : '
+# Token address to stream (omit to use native XLM).
+TOKEN_ADDRESS=
+'}
+`;
+  }
+  return `# StreamFi / Stellar testnet
+NEXT_PUBLIC_NETWORK=testnet
+
+# Deployed DripFactory contract ID for the chosen network. Required for
+# list()/streamCount()/streamAddress() queries.
+FACTORY_ADDRESS=
+
+# Secret key for signing transactions. Required for creating/withdrawing streams.
+# Deliberately NOT NEXT_PUBLIC_-prefixed; see lib/conduit.ts.
+STELLAR_SECRET=
+
+# Default address to query streams for (can also be typed in the UI).
+NEXT_PUBLIC_ADDRESS=
+`;
 }
 
 function run(command, args, options) {
   execFileSync(command, args, { stdio: 'inherit', ...options });
 }
 
-function scaffold(options, dependencies = { existsSync, writeFileSync, resolve, run }) {
+function scaffold(options, dependencies = { existsSync, writeFileSync, cpSync, resolve, run }) {
   const targetDirectory = dependencies.resolve(process.cwd(), options.projectName);
   if (dependencies.existsSync(targetDirectory)) {
     throw new Error(`The directory "${options.projectName}" already exists`);
   }
 
-  console.log(`Creating a StreamFi app in ${targetDirectory}...`);
-  dependencies.run('git', ['clone', '--depth', '1', options.template, targetDirectory]);
+  // Resolve built-in template names to their directories; treat anything else
+  // as a git URL to clone.
+  const templateName = options.template || 'next-app';
+  const isBuiltIn = BUILT_IN_TEMPLATES.includes(templateName);
+  const isGitUrl = !isBuiltIn && Boolean(options.template) && /^https?:\/\//.test(options.template);
+
+  if (!isBuiltIn && !isGitUrl && options.template) {
+    throw new Error(`Unknown template "${templateName}". Choose one of: ${BUILT_IN_TEMPLATES.join(', ')}, or pass a git URL.`);
+  }
+
+  if (isGitUrl) {
+    console.log(`Creating a StreamFi app in ${targetDirectory}...`);
+    dependencies.run('git', ['clone', '--depth', '1', options.template, targetDirectory]);
+  } else {
+    const templateDir = templateName === 'next-app'
+      ? BUNDLED_TEMPLATE_DIR
+      : dependencies.resolve(TEMPLATES_DIR, templateName);
+    console.log(`Creating a StreamFi app in ${targetDirectory} (from the "${templateName}" template)...`);
+    dependencies.cpSync(templateDir, targetDirectory, { recursive: true });
+  }
 
   const envPath = dependencies.resolve(targetDirectory, '.env.local');
-  dependencies.writeFileSync(envPath, testnetEnv(), 'utf8');
+  dependencies.writeFileSync(envPath, testnetEnv(templateName), 'utf8');
 
   if (!options.skipInstall) {
     dependencies.run('npm', ['install'], { cwd: targetDirectory });
-    dependencies.run('npm', ['install', SDK_PACKAGE], { cwd: targetDirectory });
+    // The bundled templates already declare @conduit-protocol/sdk as a
+    // dependency; an external git-url starter generally won't.
+    if (isGitUrl) {
+      dependencies.run('npm', ['install', SDK_PACKAGE], { cwd: targetDirectory });
+    }
   }
 
   console.log('\nYour StreamFi app is ready!');
   console.log(`\n  cd ${basename(targetDirectory)}`);
-  console.log('  npm run dev');
+  console.log(templateName === 'next-app' ? '  npm run dev' : '  npm start');
 }
 
-module.exports = { DEFAULT_TEMPLATE, SDK_PACKAGE, parseArguments, scaffold, testnetEnv };
+module.exports = { DEFAULT_TEMPLATE, BUNDLED_TEMPLATE_DIR, TEMPLATES_DIR, SDK_PACKAGE, BUILT_IN_TEMPLATES, parseArguments, scaffold, testnetEnv };

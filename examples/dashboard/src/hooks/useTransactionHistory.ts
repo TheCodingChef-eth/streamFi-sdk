@@ -77,7 +77,7 @@ export function useTransactionHistory(
   // No wallet connected: settle into a valid, non-loading empty state.
   useEffect(() => {
     if (!walletAddress) {
-      dispatch({ type: 'LOAD_SUCCESS', payload: [] });
+      dispatch({ type: 'LOAD_SUCCESS', payload: [], walletAddress });
     }
   }, [walletAddress]);
 
@@ -90,9 +90,9 @@ export function useTransactionHistory(
     // `data` may legitimately be undefined here — normalizeTransactions
     // handles that and yields an empty array.
     if (data !== undefined) {
-      dispatch({ type: 'LOAD_SUCCESS', payload: data });
+      dispatch({ type: 'LOAD_SUCCESS', payload: data, walletAddress });
     }
-  }, [data, loading]);
+  }, [data, loading, walletAddress]);
 
   useEffect(() => {
     if (error) dispatch({ type: 'LOAD_FAILURE', error });

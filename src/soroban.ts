@@ -18,6 +18,7 @@ import {
 import type { Network } from './types/index.js';
 import type { Signer } from './signer.js';
 import { RateLimitError, StreamFiNetworkError, InsufficientBalanceError } from './errors.js';
+import { withRetry } from './with-retry.js';
 
 // ── RPC Server cache ─────────────────────────────────────────────────────────
 // Reusing SorobanRpc.Server instances avoids creating a new HTTP agent per
@@ -89,7 +90,10 @@ function normalizePollingOptions(options: ConfirmationPollingOptions = {}): Requ
 
 /**
  * Creates a SorobanRpc.Server instance wrapped with an exponential backoff retry mechanism.
- * Retries on HTTP 429 and 503 rate limits.
+ * Retries on HTTP 429 rate limits (throttled — back off and retry the same
+ * endpoint), but fails fast on HTTP 503, which is surfaced as a
+ * {@link RpcServiceUnavailableError} so callers can fail over to a
+ * different RPC URL instead of retrying a node that is down. See #456.
  */
 export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
   const cached = _proxiedServerCache.get(rpcUrl);
@@ -97,38 +101,17 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 
   const server = getServer(rpcUrl);
 
-  const ASYNC_METHODS = [
-    'getAccount',
-    'getEvents',
-    'simulateTransaction',
-    'sendTransaction',
-    'getTransaction',
-    'getLatestLedger',
-    'getNetwork',
-  ];
+  const EXCLUDED_METHODS = ['constructor'];
 
   const proxied = new Proxy(server, {
     get(target, propKey, receiver) {
       const origMethod = Reflect.get(target, propKey, receiver) as unknown;
-      if (typeof origMethod === 'function' && typeof propKey === 'string' && ASYNC_METHODS.includes(propKey)) {
+      if (typeof origMethod === 'function' && typeof propKey === 'string' && !EXCLUDED_METHODS.includes(propKey)) {
         return async function (...args: unknown[]) {
-          const MAX_RETRIES = 3;
-          let delay = 500;
-
-          for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            try {
-              return await (origMethod as (...a: unknown[]) => Promise<unknown>).apply(target, args);
-            } catch (err) {
-              const rateLimitErr = RateLimitError.fromRpcError(err);
-
-              if (!rateLimitErr || attempt === MAX_RETRIES) {
-                throw rateLimitErr ?? err;
-              }
-              const waitTime = rateLimitErr.retryAfterMs ?? delay;
-              await sleep(waitTime);
-              delay *= 2; // Backoff factor: 2x
-            }
-          }
+          return withRetry(
+            () => (origMethod as (...a: unknown[]) => Promise<unknown>).apply(target, args),
+            { maxRetries: 3, baseDelayMs: 500, backoffFactor: 2 },
+          );
         };
       }
       return Reflect.get(target, propKey, receiver);
@@ -140,10 +123,32 @@ export function createRpcServer(rpcUrl: string): SorobanRpc.Server {
 }
 
 /**
+ * Resolve the inclusion (bid) fee, in stroops, for a submitted transaction.
+ *
+ * An explicit `fee` always wins. Otherwise `feeMultiplier` scales
+ * `BASE_FEE`. With neither set, this returns `BASE_FEE` (the network
+ * minimum) unchanged — the previous, always-hardcoded behaviour. `BASE_FEE`
+ * alone is not competitive under inclusion-fee pressure (surge pricing,
+ * congested ledgers): the bid goes unselected, `_sendAndPoll` exhausts its
+ * poll attempts, and the caller sees a misleading "Transaction timed out"
+ * instead of "fee too low" (see #509).
+ */
+export function resolveFee(config: { fee?: string; feeMultiplier?: number }): string {
+  if (config.fee !== undefined) return config.fee;
+  if (config.feeMultiplier !== undefined) {
+    return (BigInt(BASE_FEE) * BigInt(config.feeMultiplier)).toString();
+  }
+  return BASE_FEE;
+}
+
+/**
  * Build a contract-call transaction for simulate or submit.
  *
  * Fetches the caller's account from the RPC to get the current sequence
  * number, then wraps the call in a TransactionBuilder.
+ *
+ * @param fee - Inclusion fee in stroops. Defaults to `BASE_FEE`; pass the
+ * result of {@link resolveFee} to honour `ConduitConfig.fee`/`feeMultiplier`.
  */
 export async function buildContractCallTx(
   rpcUrl:      string,
@@ -152,6 +157,7 @@ export async function buildContractCallTx(
   contractId:  string,
   method:      string,
   args:        xdr.ScVal[],
+  fee:         string = BASE_FEE,
 ): Promise<ReturnType<TransactionBuilder['build']>> {
   const server  = createRpcServer(rpcUrl);
 
@@ -165,7 +171,7 @@ export async function buildContractCallTx(
   const contract = new Contract(contractId);
 
   return new TransactionBuilder(account, {
-    fee:            BASE_FEE,
+    fee,
     networkPassphrase: passphrase,
   })
     .addOperation(contract.call(method, ...args))
@@ -223,7 +229,9 @@ export async function invokeContract(
     try {
       status = await catchNetworkError('getTransaction', server.getTransaction(hash));
     } catch (err) {
-      throw RateLimitError.fromRpcError(err) ?? err;
+      // Transaction was already submitted; return the hash as pending.
+      // Polling failures don't indicate submission failure.
+      return hash;
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       return hash;
@@ -232,7 +240,8 @@ export async function invokeContract(
       throw new Error(`Transaction failed: ${hash}`);
     }
   }
-  throw new Error(`Transaction timed out: ${hash}`);
+  // Polling timed out but transaction was submitted; return hash as pending.
+  return hash;
 }
 
 /**
@@ -330,9 +339,37 @@ export function scValToU64(val: xdr.ScVal): bigint {
   return BigInt(val.u64().toString());
 }
 
-/** Encode a u64 value as ScVal */
+/**
+ * Convert an ScVal u32 to number, checking the ScVal's shape first. A raw
+ * `val.u32()` call throws an opaque XDR error ("bad union switch" etc.) when
+ * the contract returns a different numeric width than expected; this surfaces
+ * a clear, typed error instead so callers don't have to decode an XDR
+ * exception to find out their assumption about the response shape was wrong.
+ */
+export function scValToU32(val: xdr.ScVal): number {
+  if (val.switch().name !== 'scvU32') {
+    throw new Error(`Expected a u32 ScVal, got "${val.switch().name}" instead.`);
+  }
+  return val.u32();
+}
+
+/**
+ * Encode a u64 value as ScVal.
+ *
+ * Rejects a non-integer `number` (`2.5`) or a negative value with a clear
+ * `RangeError` naming the argument, rather than letting `Uint64.fromString`
+ * throw an opaque XDR error — or, worse, wrap a garbage value — deep inside
+ * stellar-sdk (#577).
+ */
 export function u64ToScVal(val: bigint | number): xdr.ScVal {
-  return xdr.ScVal.scvU64(xdr.Uint64.fromString(val.toString()));
+  if (typeof val === 'number' && !Number.isInteger(val)) {
+    throw new RangeError(`u64ToScVal: expected an integer, got ${val}`);
+  }
+  const asBigInt = typeof val === 'bigint' ? val : BigInt(val);
+  if (asBigInt < 0n) {
+    throw new RangeError(`u64ToScVal: expected a non-negative value, got ${val}`);
+  }
+  return xdr.ScVal.scvU64(xdr.Uint64.fromString(asBigInt.toString()));
 }
 
 /** Encode a boolean as ScVal */
@@ -347,24 +384,70 @@ function sleep(ms: number): Promise<void> {
 // ── Network error helpers ─────────────────────────────────────────────────────
 
 /**
+ * Error codes that identify a transport-level failure: connection
+ * refused/reset, DNS resolution failure, timeout, unreachable host. These
+ * come from Node's net/dns layer (`ECONNREFUSED`, `ENOTFOUND`, ...),
+ * undici (`UND_ERR_*`), axios (`ERR_NETWORK`), or the browser fetch stack
+ * (`ERR_CONN_*`).
+ */
+const NETWORK_ERROR_CODE_PATTERN =
+  /^(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|EPIPE|ERR_NETWORK|ERR_CONN|ERR_SOCKET|UND_ERR|ERR_HTTP2_CONNECT_ERROR|ERR_TLS)/i;
+
+/**
+ * Canonical network-layer failure messages produced by the fetch/axios HTTP
+ * stacks. These are matched exactly (never substring-matched) so an unrelated
+ * programming TypeError such as `Cannot read properties of undefined (reading
+ * 'connect')` is not misclassified as a network outage.
+ */
+const NETWORK_TYPE_ERROR_MESSAGES = new Set([
+  'fetch failed',    // Node.js undici
+  'Failed to fetch', // Chromium fetch
+  'Network Error',   // axios (browser)
+  'Load failed',     // Safari fetch
+]);
+
+/**
+ * Walks an error and its nested `cause` chain looking for a transport-level
+ * error code. Node's `fetch` rejects with `TypeError: fetch failed` whose
+ * `.cause` carries the real errno code (e.g. `ECONNREFUSED`), so checking the
+ * nested cause is more reliable than substring-matching the whole error text.
+ */
+function hasNetworkErrorCode(cause: unknown): boolean {
+  let current: unknown = cause;
+  for (let depth = 0; depth < 5 && current !== null && typeof current === 'object'; depth++) {
+    if ('code' in current) {
+      const code = String((current as { code: unknown }).code);
+      if (NETWORK_ERROR_CODE_PATTERN.test(code)) return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
  * Catches an RPC-level error (e.g. `TypeError: fetch failed`) and re-throws it
  * as a `StreamFiNetworkError` so callers can distinguish network outages from
  * contract-logic failures.
+ *
+ * Only errors that are *provably* transport failures are reclassified: the
+ * canonical fetch/axios network messages, or an error (or its nested `cause`)
+ * carrying a network errno code. A `TypeError` from a programming mistake in
+ * the simulate/assemble/sign pipeline is re-thrown as-is so it isn't masked
+ * as a network outage. See #457.
  */
 export function catchNetworkError<T>(label: string, promise: Promise<T>): Promise<T> {
   return promise.catch((cause: unknown) => {
     if (cause instanceof StreamFiNetworkError || cause instanceof InsufficientBalanceError) {
       throw cause;
     }
-    if (cause instanceof TypeError && /fetch|network|connect|refused|dns|econnrefused|enotfound|etimedout/i.test(String(cause))) {
-      throw new StreamFiNetworkError(`Network error during ${label}: ${(cause as Error).message}`, cause);
-    }
-    if (cause && typeof cause === 'object' && 'code' in cause) {
-      const code = String((cause as { code: unknown }).code);
-      if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|ERR_CONN/i.test(code)) {
-        const message = cause instanceof Error ? cause.message : String(cause);
-        throw new StreamFiNetworkError(`Network error during ${label}: ${message}`, cause);
+    if (cause instanceof TypeError) {
+      const message = (cause as Error).message ?? String(cause);
+      if (NETWORK_TYPE_ERROR_MESSAGES.has(message) || hasNetworkErrorCode(cause)) {
+        throw new StreamFiNetworkError(`Network error during ${label}: ${(cause as Error).message}`, cause);
       }
+    } else if (hasNetworkErrorCode(cause)) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new StreamFiNetworkError(`Network error during ${label}: ${message}`, cause);
     }
     // Re-throw non-network errors as-is
     throw cause;
@@ -398,25 +481,66 @@ export async function queryXlmBalance(
 }
 
 /**
- * Estimate the minimum resource fee required for a transaction simulation.
- * If the simulation already failed with WasmVm, we return a lower bound based
- * on typical Soroban contract call costs (this is a best-effort estimate).
+ * Realistic estimate of a Soroban contract-call resource fee in stroops
+ * (0.1 XLM). Used when a simulation carries no fee fields — e.g. an
+ * error-response simulation (WasmVm/InvalidAction insufficient balance)
+ * reports neither `minResourceFee` nor `fee`. A typical resource fee is a
+ * small fraction of one XLM, so this is a fair estimate; the previous
+ * 500 XLM fallback overstated the required balance by ~500 XLM (see #430).
  */
-export function estimateRequiredFee(simResult: unknown, fallbackStroops = 5_000_000_000n): bigint {
+export const DEFAULT_RESOURCE_FEE_ESTIMATE = 1_000_000n;
+
+/**
+ * Larger fallback used for expensive operations that deploy or instantiate
+ * contracts (e.g. `create_stream`). This is a conservative default sized in
+ * stroops (3 XLM) to avoid under-estimating required balance in the
+ * insufficient-balance error path when the simulation carries no fee fields.
+ */
+export const CREATE_RESOURCE_FEE_ESTIMATE = 30_000_000n;
+
+/**
+ * Estimate the minimum resource fee required for a transaction simulation.
+ *
+ * A successful simulation reports the fee in `minResourceFee` (preferred)
+ * or `fee`. An error-response simulation — the shape passed in from the
+ * insufficient-balance path in `StreamsModule.create()` — carries neither
+ * field, so we fall back to {@link DEFAULT_RESOURCE_FEE_ESTIMATE} rather
+ * than an inflated upper bound.
+ */
+export function estimateRequiredFee(simResult: unknown, fallbackStroops = DEFAULT_RESOURCE_FEE_ESTIMATE): bigint {
   if (simResult && typeof simResult === 'object') {
     const r = simResult as { minResourceFee?: unknown; fee?: unknown };
-    // Try to extract minResourceFee from the simulation result. Note: an
-    // error-response simulation (the expected caller here, since this is
-    // only reached from within an isSimulationError() branch) carries
-    // neither field, so this intentionally falls through to the fallback.
-    if (r.minResourceFee !== undefined) {
-      const fee = BigInt(r.minResourceFee as string | number | bigint);
-      if (fee > 0n) return fee;
-    }
-    if (r.fee !== undefined) {
-      const fee = BigInt(r.fee as string | number | bigint);
-      if (fee > 0n) return fee;
-    }
+    const fromMin = toPositiveBigIntOrNull(r.minResourceFee);
+    if (fromMin !== null) return fromMin;
+    const fromFee = toPositiveBigIntOrNull(r.fee);
+    if (fromFee !== null) return fromFee;
   }
-  return fallbackStroops; // ~500 XLM default upper-bound estimate
+  return fallbackStroops;
+}
+
+/**
+ * Coerce an RPC-supplied fee field to a positive `bigint`, or `null` if it
+ * can't be — including the case a non-conforming RPC returns a float
+ * (`minResourceFee: 1234.5`), which would make a bare `BigInt(...)` throw a
+ * raw `RangeError` out of the fee-estimation path and abort a `create()`
+ * that could have fallen back to the default estimate (#577).
+ */
+function toPositiveBigIntOrNull(value: unknown): bigint | null {
+  if (value === undefined || value === null) return null;
+  try {
+    let n: bigint;
+    if (typeof value === 'bigint') {
+      n = value;
+    } else if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return null;
+      n = BigInt(Math.trunc(value));
+    } else if (typeof value === 'string') {
+      n = BigInt(value.trim());
+    } else {
+      return null;
+    }
+    return n > 0n ? n : null;
+  } catch {
+    return null;
+  }
 }

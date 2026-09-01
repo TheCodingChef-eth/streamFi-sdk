@@ -63,8 +63,13 @@ describe('WebSocketRelayer — High-Concurrency Stress Tests', () => {
     }
     await Promise.all(promises);
 
+    // connectPromise is now assigned synchronously, before the first await,
+    // so every one of these 20 calls shares the same in-flight promise
+    // instead of some of them racing into the lock queue and only checking
+    // for an existing connection once they're finally granted it — the
+    // previously-tolerated "at most 2" is now a hard guarantee of 1 (#492).
     const wsConstructors = (global as any).WebSocket.mock.calls.length;
-    expect(wsConstructors).toBeLessThanOrEqual(2);
+    expect(wsConstructors).toBe(1);
   });
 
   it('rejects connect when the socket emits an error before opening', async () => {
@@ -274,6 +279,67 @@ describe('WebSocketRelayer — High-Concurrency Stress Tests', () => {
     expect(relayer.state.pendingCount).toBe(3);
   });
 
+  it('bounds the pending queue instead of growing it without limit', async () => {
+    const bounded = new WebSocketRelayer('ws://localhost:8082', {
+      maxReconnectAttempts: 0,
+      maxPendingMessages: 5,
+    });
+
+    for (let i = 0; i < 20; i++) {
+      bounded.send({ type: 'test', payload: { index: i } }).catch(() => {});
+    }
+
+    expect(bounded.state.pendingCount).toBe(5);
+    bounded.destroy();
+  });
+
+  it('drops the oldest queued message once the bound is reached, keeping the newest', async () => {
+    const bounded = new WebSocketRelayer('ws://localhost:8083', {
+      maxReconnectAttempts: 0,
+      maxPendingMessages: 2,
+    });
+
+    await bounded.send({ type: 'msg', payload: {}, id: '1' });
+    await bounded.send({ type: 'msg', payload: {}, id: '2' });
+    await bounded.send({ type: 'msg', payload: {}, id: '3' });
+
+    expect(bounded.state.pendingCount).toBe(2);
+    bounded.destroy();
+  });
+
+  it('rejects send() once reconnect attempts are exhausted instead of queueing forever', async () => {
+    class NeverOpensWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+
+      constructor() {
+        setTimeout(() => {
+          this.onerror?.();
+          this.onclose?.();
+        }, 0);
+      }
+    }
+
+    (global as any).WebSocket = vi.fn(function () { return new NeverOpensWebSocket(); }) as any;
+    const doomed = new WebSocketRelayer('ws://localhost:65534', {
+      maxReconnectAttempts: 0,
+      reconnectDelayMs: 1,
+    });
+
+    await expect(doomed.connect()).rejects.toThrow();
+    // Let the onclose-triggered attemptReconnect() observe attempts are exhausted.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    await expect(doomed.send({ type: 'test', payload: {} })).rejects.toThrow(/exhausted/);
+
+    doomed.destroy();
+  });
+
   it('notifies subscribers when connection state changes', async () => {
     const handler = vi.fn();
     const unsubscribe = relayer.onStateChange(handler);
@@ -295,5 +361,116 @@ describe('WebSocketRelayer — High-Concurrency Stress Tests', () => {
     relayer.destroy();
 
     expect(handler).toHaveBeenCalledTimes(3);
+  });
+
+  it('resets reconnecting state to false and emits disconnected when reconnect attempts are exhausted (#516)', async () => {
+    class AlwaysFailingWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+
+      constructor() {
+        setTimeout(() => {
+          this.onerror?.();
+          this.onclose?.();
+        }, 0);
+      }
+    }
+
+    (global as any).WebSocket = vi.fn(function () { return new AlwaysFailingWebSocket(); }) as any;
+    const stateHistory: Array<{ transition: string; state: any }> = [];
+    const doomed = new WebSocketRelayer('ws://localhost:65533', {
+      maxReconnectAttempts: 2,
+      reconnectDelayMs: 5,
+      onStateChange: (transition, state) => {
+        stateHistory.push({ transition, state: { ...state } });
+      },
+    });
+
+    await expect(doomed.connect()).rejects.toThrow();
+
+    // Wait for all 2 reconnect attempts to complete and exhaust
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Reconnection is exhausted; reconnecting must NOT be stuck at true
+    expect(doomed.state.connected).toBe(false);
+    expect(doomed.state.reconnecting).toBe(false);
+    expect(doomed.state.destroyed).toBe(false);
+
+    // Final emitted transition must be disconnected with reconnecting: false
+    const lastEvent = stateHistory[stateHistory.length - 1];
+    expect(lastEvent?.transition).toBe('disconnected');
+    expect(lastEvent?.state.reconnecting).toBe(false);
+    expect(lastEvent?.state.connected).toBe(false);
+
+    // A fresh connect() resets the exhausted state and attempts reconnect again
+    const connectPromise = doomed.connect();
+    expect(doomed.state.reconnecting).toBe(false);
+    await expect(connectPromise).rejects.toThrow();
+
+    doomed.destroy();
+  });
+
+  it('resets reconnecting state to false and aborts mid-reconnect on disconnect() (#619)', async () => {
+    class FailingOnceWebSocket {
+      readyState = 0;
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      send = vi.fn();
+      close = vi.fn();
+
+      constructor() {
+        setTimeout(() => {
+          this.onerror?.();
+          this.onclose?.();
+        }, 0);
+      }
+    }
+
+    (global as any).WebSocket = vi.fn(function () { return new FailingOnceWebSocket(); }) as any;
+    
+    let disconnectCount = 0;
+    const relayer = new WebSocketRelayer('ws://localhost:65532', {
+      maxReconnectAttempts: 5,
+      reconnectDelayMs: 20,
+      onStateChange: (transition) => {
+        if (transition === 'disconnected') {
+          disconnectCount++;
+        }
+      },
+    });
+
+    const connectPromise = relayer.connect().catch(() => {});
+
+    await new Promise((resolve) => {
+      const unsub = relayer.onStateChange((transition) => {
+        if (transition === 'reconnecting') {
+          unsub();
+          resolve(undefined);
+        }
+      });
+    });
+
+    expect(relayer.state.reconnecting).toBe(true);
+    
+    disconnectCount = 0;
+    relayer.disconnect();
+    
+    expect(relayer.state.reconnecting).toBe(false);
+    expect(disconnectCount).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    
+    expect((global as any).WebSocket).toHaveBeenCalledTimes(1);
+    expect(disconnectCount).toBe(1);
+
+    await connectPromise;
+    relayer.destroy();
   });
 });

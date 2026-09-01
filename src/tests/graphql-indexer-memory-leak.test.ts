@@ -40,15 +40,31 @@ describe('GraphQLIndexer Memory Leak & Real Network I/O Tests', () => {
 
     const result = await indexer.query({ query: queryStr, variables });
 
-    expect(fetchSpy).toHaveBeenCalledWith(endpoint, {
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [calledUrl, calledInit] = fetchSpy.mock.calls[0]!;
+    expect(calledUrl).toBe(endpoint);
+    expect(calledInit).toMatchObject({
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-      body: JSON.stringify({ query: queryStr, variables }),
+      signal: expect.any(AbortSignal),
     });
-    expect(result).toEqual(mockResponseData);
+    // Automatic Persisted Queries (#629): the first attempt sends the hash
+    // with a null query; the full string is only replayed on a cache miss.
+    expect(JSON.parse((calledInit as RequestInit).body as string)).toEqual({
+      query: null,
+      variables,
+      extensions: {
+        persistedQuery: {
+          version: 1,
+          sha256Hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      },
+    });
+    // query() returns the unwrapped GraphQL `data` payload, not the envelope.
+    expect(result).toEqual(mockResponseData.data);
 
     indexer.cleanup();
   });
@@ -64,6 +80,28 @@ describe('GraphQLIndexer Memory Leak & Real Network I/O Tests', () => {
 
     await expect(indexer.query({ query: 'query { streams { id } }' })).rejects.toThrow(
       'GraphQL query failed with status 500: Internal Server Error'
+    );
+
+    indexer.cleanup();
+  });
+
+  it('throws when a GraphQL response contains query-level errors despite HTTP 200', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: null,
+        errors: [
+          { message: 'Cannot query field "doesNotExist" on type "Query".' },
+          { message: 'Resolver error: boom' },
+        ],
+      }),
+    } as Response);
+
+    const indexer = new GraphQLIndexer(endpoint);
+
+    await expect(indexer.query({ query: 'query { doesNotExist }' })).rejects.toThrow(
+      'Cannot query field "doesNotExist" on type "Query".'
     );
 
     indexer.cleanup();

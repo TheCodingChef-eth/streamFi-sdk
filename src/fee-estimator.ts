@@ -61,6 +61,11 @@ export class FeeEstimator {
     if (this.minRefetchIntervalMs > 0) {
       const elapsed = Date.now() - (this.lastSuccessfulFetchAtValue ?? 0);
       if (elapsed < this.minRefetchIntervalMs) {
+        // Surface the last error if one exists, instead of silently returning stale fee
+        if (this.lastErrorValue) {
+          options.onError?.(this.lastErrorValue);
+          throw this.lastErrorValue;
+        }
         return this.baseFee;
       }
     }

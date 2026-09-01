@@ -1,11 +1,14 @@
-import { StrKey } from '@stellar/stellar-sdk';
+import { StrKey, Address, nativeToScVal } from '@stellar/stellar-sdk';
 import { bigintSafeStringify } from './utils.js';
+import { boolToScVal } from './soroban.js';
 import {
   buildBatchTransactions,
   buildBatchTransactionsSync,
+  paramToScVal,
   validateContext,
 } from './batch-tx.js';
-import type { BatchTransactionContext, BuiltBatchTransaction } from './batch-tx.js';
+import { OperationAbortedError } from './errors.js';
+import type { BatchTransactionContext, BuiltBatchTransaction, ScValType } from './batch-tx.js';
 
 export interface SubmitOptions {
   maxRetries?: number;
@@ -52,8 +55,11 @@ export class StreamBuilder {
   private _token?: string | undefined;
   private _sender?: string | undefined;
   private _recipient?: string | undefined;
-  private _amount?: number | undefined;
+  private _amount?: number | bigint | undefined;
   private _ratePerSecond?: number | bigint | undefined;
+  private _startTime?: number | undefined;
+  private _endTime?: number | undefined;
+  private _clawbackEnabled?: boolean | undefined;
 
   private pendingQueue: Array<Record<string, unknown>> = [];
   private activeTimers: Set<NodeJS.Timeout> = new Set();
@@ -98,12 +104,21 @@ export class StreamBuilder {
 
   /**
    * Sets the amount of tokens to stream.
+   * Accepts a number or bigint; bigint values are serialised to
+   * strings before network submission to avoid Safari/WebKit
+   * JSON.stringify quirks.
    * @param val - The amount in the token's smallest unit.
    * @returns The builder instance for chaining.
    */
-  amount(val: number): this {
-    if (!Number.isFinite(val) || val <= 0) {
-      throw new Error('Invalid StreamBuilder parameter: amount must be a positive finite number');
+  amount(val: number | bigint): this {
+    if (typeof val === 'bigint') {
+      if (val <= 0n) {
+        throw new Error('Invalid StreamBuilder parameter: amount must be a positive value');
+      }
+    } else {
+      if (!Number.isFinite(val) || val <= 0) {
+        throw new Error('Invalid StreamBuilder parameter: amount must be a positive finite number');
+      }
     }
     this._amount = val;
     return this;
@@ -132,6 +147,54 @@ export class StreamBuilder {
   }
 
   /**
+   * Sets the stream's start time (Unix timestamp, seconds).
+   * Optional; the real `create_stream` contract call defaults to "now" when
+   * omitted (see {@link toContractArgs}).
+   * @param val - Unix timestamp in seconds. Must not be in the past.
+   * @returns The builder instance for chaining.
+   */
+  startTime(val: number): this {
+    if (!Number.isInteger(val) || val < 0) {
+      throw new Error('Invalid StreamBuilder parameter: startTime must be a non-negative integer Unix timestamp');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (val < now) {
+      throw new Error('Invalid StreamBuilder parameter: startTime cannot be in the past');
+    }
+    this._startTime = val;
+    return this;
+  }
+
+  /**
+   * Sets the stream's end time (Unix timestamp, seconds).
+   * Optional; the real `create_stream` contract call defaults to `0`
+   * (open-ended, no end) when omitted (see {@link toContractArgs}).
+   * @param val - Unix timestamp in seconds.
+   * @returns The builder instance for chaining.
+   */
+  endTime(val: number): this {
+    if (!Number.isInteger(val) || val < 0) {
+      throw new Error('Invalid StreamBuilder parameter: endTime must be a non-negative integer Unix timestamp');
+    }
+    this._endTime = val;
+    return this;
+  }
+
+  /**
+   * Sets whether the sender may claw back unstreamed tokens.
+   * Optional; defaults to `false` (see {@link toContractArgs}).
+   * @param val - Whether clawback is enabled.
+   * @returns The builder instance for chaining.
+   */
+  clawbackEnabled(val: boolean): this {
+    if (typeof val !== 'boolean') {
+      throw new Error('Invalid StreamBuilder parameter: clawbackEnabled must be a boolean');
+    }
+    this._clawbackEnabled = val;
+    return this;
+  }
+
+  /**
    * Validates and produces the final stream configuration.
    * Any bigint fields are converted to strings to guarantee safe
    * serialisation across all browsers (Safari/WebKit included).
@@ -153,11 +216,21 @@ export class StreamBuilder {
       token: this._token,
       sender: this._sender,
       recipient: this._recipient,
-      amount: this._amount,
+      amount: typeof this._amount === 'bigint' ? this._amount.toString() : this._amount,
     };
     if (this._ratePerSecond !== undefined && this._ratePerSecond !== null) {
-      config.ratePerSecond = this._ratePerSecond;
+      // build()'s return type promises `ratePerSecond?: string`, but
+      // bigintSafeStringify() only stringifies `bigint` values — a `number`
+      // input would otherwise pass through unchanged and lie about its type
+      // at runtime. Coerce numeric inputs here so the declared type is
+      // honest (see #459).
+      config.ratePerSecond = typeof this._ratePerSecond === 'number'
+        ? String(this._ratePerSecond)
+        : this._ratePerSecond;
     }
+    if (this._startTime !== undefined) config.startTime = this._startTime;
+    if (this._endTime !== undefined) config.endTime = this._endTime;
+    if (this._clawbackEnabled !== undefined) config.clawbackEnabled = this._clawbackEnabled;
 
     return bigintSafeStringify(config) as {
       token: string;
@@ -165,7 +238,62 @@ export class StreamBuilder {
       recipient: string;
       amount: number;
       ratePerSecond?: string;
+      startTime?: number;
+      endTime?: number;
+      clawbackEnabled?: boolean;
     };
+  }
+
+  /**
+   * Produces the exact positional argument list the real `DripFactory`
+   * `create_stream` contract call expects:
+   * `(sender, recipient, token, deposit_amount: i128, rate_per_sec: i128,
+   * start_time: u64, end_time: u64, clawback_enabled: bool)`.
+   *
+   * `build()` alone is not enough to invoke the real contract — its output
+   * uses camelCase keys and an `amount` that {@link ConduitBatcher.execute}
+   * would encode as `i64` rather than the `i128` the contract requires, and
+   * it never carries `startTime`/`endTime`/`clawbackEnabled` at all (see
+   * #435). This method produces the ABI-exact `unknown[]` to pass as
+   * {@link BatchOperation.args}, e.g.
+   * `batcher.executeAsync([{ method: 'create_stream', params: {}, args: builder.toContractArgs() }], { context })`.
+   *
+   * @throws {Error} If any `build()`-required field is missing/malformed, or
+   * if `ratePerSecond` was never set — the contract has no way to derive a
+   * rate on its own, so a missing rate here would silently drop a required
+   * argument rather than fail loudly.
+   */
+  toContractArgs(): unknown[] {
+    const config = this.build();
+    if (this._ratePerSecond === undefined || this._ratePerSecond === null) {
+      throw new Error(
+        'Invalid StreamBuilder parameter: ratePerSecond is required to build create_stream contract arguments',
+      );
+    }
+
+    const start = this._startTime ?? Math.floor(Date.now() / 1000);
+    const end = this._endTime ?? 0;
+
+    return [
+      new Address(config.sender).toScVal(),
+      new Address(config.recipient).toScVal(),
+      new Address(config.token).toScVal(),
+      nativeToScVal(config.amount, { type: 'i128' }),
+      nativeToScVal(this._ratePerSecond, { type: 'i128' }),
+      nativeToScVal(start, { type: 'u64' }),
+      nativeToScVal(end, { type: 'u64' }),
+      boolToScVal(this._clawbackEnabled ?? false),
+    ];
+  }
+
+  /**
+   * Wraps {@link toContractArgs} in a {@link BatchOperation}, ready to pass
+   * to {@link ConduitBatcher.executeAsync} (or the operations array built
+   * for {@link ConduitBatcher.execute}'s underlying transaction builder).
+   * @param method - Contract method to invoke. Defaults to `create_stream`.
+   */
+  toBatchOperation(method = 'create_stream'): BatchOperation {
+    return { method, params: {}, args: this.toContractArgs() };
   }
 
   /**
@@ -185,7 +313,7 @@ export class StreamBuilder {
 
     const { signal } = options;
     if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
+      throw new OperationAbortedError('submit');
     }
 
     // Backpressure: reject if queue is full
@@ -213,7 +341,7 @@ export class StreamBuilder {
         }
 
         if (signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
+          throw new OperationAbortedError('submit');
         }
 
         try {
@@ -225,7 +353,7 @@ export class StreamBuilder {
           return result;
         } catch (err) {
           if (signal?.aborted) {
-            throw new DOMException('Aborted', 'AbortError');
+            throw new OperationAbortedError('submit');
           }
           lastError = err;
           attempt++;
@@ -244,7 +372,7 @@ export class StreamBuilder {
                   clearTimeout(timer);
                   this.activeTimers.delete(timer);
                   signal.removeEventListener('abort', onAbort);
-                  reject(new DOMException('Aborted', 'AbortError'));
+                  reject(new OperationAbortedError('submit'));
                 };
                 signal.addEventListener('abort', onAbort, { once: true });
               }
@@ -293,10 +421,10 @@ export class StreamBuilder {
         );
       }
     } else {
-      // sender / recipient — must be valid Ed25519 public keys (G-addresses)
-      if (!StrKey.isValidEd25519PublicKey(address)) {
+      // sender / recipient — must be valid Stellar addresses (G-address or C-address)
+      if (!StrKey.isValidEd25519PublicKey(address) && !StrKey.isValidContract(address)) {
         throw new Error(
-          `Invalid StreamBuilder parameter: ${field} must be a valid Stellar public key (G-address), got "${address}"`,
+          `Invalid StreamBuilder parameter: ${field} must be a valid Stellar public key or contract address (G-address or C-address), got "${address}"`,
         );
       }
     }
@@ -314,6 +442,13 @@ export interface BatchOperation {
    * single map argument.
    */
   args?: unknown[];
+  /**
+   * Per-field ScVal type hints for the `params` map, keyed by field name
+   * (e.g. `{ streamId: 'u64' }` for a u64 stream ID, `{ amount: 'i128' }`
+   * for an i128 amount). Without a hint the default inference applies —
+   * positive integers encode as `u64`, negatives as `i64` (see #497).
+   */
+  types?: Record<string, ScValType>;
 }
 
 export interface BatchExecuteOptions {
@@ -423,19 +558,19 @@ function validatePayload(streams: unknown): string[] {
         }
       }
 
-      // Validate sender field — must be a valid Ed25519 public key (G-address)
+      // Validate sender field — must be a valid Stellar public key (G-address) or contract ID (C-address)
       if (obj.sender !== undefined && obj.sender !== null) {
         const sender = String(obj.sender);
-        if (!StrKey.isValidEd25519PublicKey(sender)) {
-          errors.push(`Batch item at index ${i}: sender must be a valid Stellar public key (G-address), got "${sender}"`);
+        if (!StrKey.isValidEd25519PublicKey(sender) && !StrKey.isValidContract(sender)) {
+          errors.push(`Batch item at index ${i}: sender must be a valid Stellar public key or contract address (G-address or C-address), got "${sender}"`);
         }
       }
 
-      // Validate recipient field — must be a valid Ed25519 public key (G-address)
+      // Validate recipient field — must be a valid Stellar public key (G-address) or contract ID (C-address)
       if (obj.recipient !== undefined && obj.recipient !== null) {
         const recipient = String(obj.recipient);
-        if (!StrKey.isValidEd25519PublicKey(recipient)) {
-          errors.push(`Batch item at index ${i}: recipient must be a valid Stellar public key (G-address), got "${recipient}"`);
+        if (!StrKey.isValidEd25519PublicKey(recipient) && !StrKey.isValidContract(recipient)) {
+          errors.push(`Batch item at index ${i}: recipient must be a valid Stellar public key or contract address (G-address or C-address), got "${recipient}"`);
         }
       }
 
@@ -529,7 +664,28 @@ export class ConduitBatcher {
     }
 
     const method = options.method ?? 'create_stream';
-    const operations = sanitized.map(params => ({ method, params }));
+    const operations = sanitized.map(params => {
+      if (method === 'create_stream') {
+        // ABI-exact create_stream args: (sender, recipient, token,
+        // deposit_amount: i128, rate_per_sec: i128, start_time: u64,
+        // end_time: u64, clawback_enabled: bool). Previously these raw values
+        // were run through paramToScVal's blanket i64/i128 encoding, so
+        // start_time/end_time arrived as i64 and amounts as the wrong width;
+        // each arg is now typed explicitly (see #497).
+        const args = [
+          paramToScVal(params.sender),
+          paramToScVal(params.recipient),
+          paramToScVal(params.token),
+          paramToScVal(params.amount, 'i128'),
+          paramToScVal(params.ratePerSecond, 'i128'),
+          paramToScVal(params.startTime ?? 0, 'u64'),
+          paramToScVal(params.endTime ?? 0, 'u64'),
+          boolToScVal(params.clawbackEnabled === true),
+        ];
+        return { method, args };
+      }
+      return { method, params };
+    });
 
     try {
       return toBatchResult(buildBatchTransactionsSync(operations, options.context), chunks);

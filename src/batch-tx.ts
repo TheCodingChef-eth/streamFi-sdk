@@ -33,6 +33,7 @@ import {
   Contract,
   SorobanRpc,
   StrKey,
+  Transaction,
   TransactionBuilder,
   nativeToScVal,
   xdr,
@@ -144,13 +145,32 @@ export function validateContext(context: BatchTransactionContext): string[] {
 }
 
 /**
+ * ScVal type names accepted by {@link paramToScVal} (and per-field `types` on
+ * batch operations) to force a specific encoding instead of the default
+ * inference.
+ */
+export type ScValType =
+  | 'u32' | 'i32' | 'u64' | 'i64' | 'u128' | 'i128' | 'u256' | 'i256'
+  | 'string' | 'symbol' | 'address' | 'bool' | 'bytes';
+
+/**
  * Convert a single parameter to an ScVal.
  *
- * Strings that are valid Stellar addresses become `Address` values rather than
- * string values — passing a G- or C-address as a plain string is a common way
- * to build a transaction the contract then rejects.
+ * - Already-encoded `xdr.ScVal` values pass through untouched — their type is
+ *   already explicit, so re-encoding would destroy it.
+ * - An explicit `type` hint wins over every heuristic (see
+ *   {@link BatchOperation.types} for per-field hints in the params map).
+ * - Strings that are valid Stellar addresses become `Address` values rather
+ *   than string values — passing a G- or C-address as a plain string is a
+ *   common way to build a transaction the contract then rejects.
+ * - Everything else falls back to the SDK's natural encoding: positive
+ *   integers become `u64` and negatives `i64`. This is what the contract
+ *   expects for the u64-heavy ABI fields such as `create_stream`'s
+ *   `start_time`/`end_time` and stream IDs; previously every integer `number`
+ *   was forced to `i64` and every `bigint` to `i128`, producing the wrong
+ *   ScVal type and a contract-side type error (see #497).
  */
-export function paramToScVal(value: unknown): xdr.ScVal {
+export function paramToScVal(value: unknown, type?: ScValType): xdr.ScVal {
   // Values with no ScVal representation (symbols, functions, undefined) map to
   // void rather than throwing — validation has already accepted the payload, so
   // a stray non-serialisable field must not take the whole batch down.
@@ -164,15 +184,20 @@ export function paramToScVal(value: unknown): xdr.ScVal {
   if (value === null) {
     return xdr.ScVal.scvVoid();
   }
+  if (value instanceof xdr.ScVal) {
+    return value;
+  }
+
+  // An explicit type hint means the caller knows the contract ABI — trust it
+  // over any heuristic below (e.g. `{ streamId: 'u64' }`, `{ amount: 'i128' }`).
+  if (type !== undefined) {
+    return nativeToScVal(value, { type });
+  }
+
   if (typeof value === 'string' && (StrKey.isValidEd25519PublicKey(value) || StrKey.isValidContract(value))) {
     return new Address(value).toScVal();
   }
-  if (typeof value === 'bigint') {
-    return nativeToScVal(value, { type: 'i128' });
-  }
-  if (typeof value === 'number' && Number.isInteger(value)) {
-    return nativeToScVal(value, { type: 'i64' });
-  }
+
   return nativeToScVal(value);
 }
 
@@ -181,14 +206,18 @@ export function paramToScVal(value: unknown): xdr.ScVal {
  *
  * `args` wins when present, so a caller who knows the contract ABI controls the
  * positional arguments exactly. Otherwise `params` is passed as a single map
- * argument, keyed by field name.
+ * argument, keyed by field name, with `types` supplying per-field ScVal type
+ * information when the default inference would pick the wrong type (e.g. a
+ * u64 stream ID, which untyped would encode as a string after bigint
+ * serialisation, or an i128 amount).
  */
 export function operationToScVals(operation: {
   params?: Record<string, unknown> | undefined;
+  types?: Record<string, ScValType> | undefined;
   args?: unknown[] | undefined;
 }): xdr.ScVal[] {
   if (Array.isArray(operation.args)) {
-    return operation.args.map(paramToScVal);
+    return operation.args.map(arg => paramToScVal(arg));
   }
 
   const params = operation.params ?? {};
@@ -203,7 +232,7 @@ export function operationToScVals(operation: {
         .map(([key, value]) =>
           new xdr.ScMapEntry({
             key: nativeToScVal(key, { type: 'symbol' }),
-            val: paramToScVal(value),
+            val: paramToScVal(value, operation.types?.[key]),
           }),
         ),
     ),
@@ -213,6 +242,8 @@ export function operationToScVals(operation: {
 interface BuildableOperation {
   method: string;
   params?: Record<string, unknown> | undefined;
+  /** Per-field ScVal type hints for `params` map entries (see #497). */
+  types?: Record<string, ScValType> | undefined;
   args?: unknown[] | undefined;
 }
 
@@ -259,7 +290,10 @@ export function buildBatchTransactionsSync(
  * Build one transaction per operation and prepare each via RPC simulation, so
  * the returned XDR carries its footprint and auth and is ready to submit.
  *
- * Falls back to offline building when no `rpcUrl` is configured.
+ * Falls back to offline building when no `rpcUrl` is configured. Either
+ * `sequence` or `rpcUrl` is required — `sequence` builds offline, `rpcUrl`
+ * fetches the sequence and prepares the transactions. Supplying neither fails
+ * validation.
  */
 export async function buildBatchTransactions(
   operations: BuildableOperation[],
@@ -327,4 +361,238 @@ export async function buildBatchTransactions(
     const assembled = SorobanRpc.assembleTransaction(tx, simulation).build();
     return { index, method: operation.method, xdr: assembled.toXDR(), prepared: true };
   });
+}
+
+// ── Sequential batch submission ───────────────────────────────────────────────
+
+/**
+ * Outcome for one transaction in a submitted batch.
+ *
+ * `status` mirrors the Soroban terminal states plus two SDK-side sentinels:
+ * - `'SUCCESS'`  — confirmed on-chain; `txHash` is set.
+ * - `'FAILED'`   — submitted but the network rejected it; `error` is set.
+ * - `'SKIPPED'`  — not submitted because an earlier transaction in the batch
+ *   failed (its sequence number would be invalid anyway).
+ * - `'ERROR'`    — a local or RPC error prevented submission; `error` is set.
+ */
+export type BatchTxStatus = 'SUCCESS' | 'FAILED' | 'SKIPPED' | 'ERROR';
+
+export interface BatchTxOutcome {
+  /** Position of this transaction in the original array. */
+  index: number;
+  method: string;
+  status: BatchTxStatus;
+  /** Transaction hash, present when status is 'SUCCESS'. */
+  txHash?: string;
+  /** Human-readable reason, present when status is 'FAILED', 'SKIPPED', or 'ERROR'. */
+  error?: string;
+}
+
+/** Overall result returned by {@link submitBatch}. */
+export interface BatchSubmitResult {
+  /**
+   * True only when every transaction in the batch was confirmed on-chain.
+   * False as soon as any transaction is FAILED, SKIPPED, or ERROR.
+   */
+  allSucceeded: boolean;
+  /**
+   * Index of the first transaction that did not succeed, or -1 when all
+   * succeeded. Every transaction after this index will be SKIPPED.
+   */
+  firstFailureIndex: number;
+  outcomes: BatchTxOutcome[];
+}
+
+export interface BatchSubmitOptions {
+  /** Milliseconds to wait between confirmation polls. Default: 1 000 ms. */
+  pollIntervalMs?: number;
+  /** Maximum number of poll attempts per transaction. Default: 30. */
+  maxPollAttempts?: number;
+  /**
+   * Network passphrase used to reconstruct the Transaction object from XDR
+   * before submission. Required unless `sign` returns a raw XDR string that
+   * already encodes the passphrase (in which case the SDK extracts it during
+   * signing). Defaults to an empty string, which is safe when the assembled
+   * XDR was produced by `buildBatchTransactions` (the passphrase is embedded
+   * in the transaction's network hash, not the envelope itself).
+   *
+   * In practice, pass the same passphrase used when building — e.g.
+   * `Networks.TESTNET` for testnet.
+   */
+  networkPassphrase?: string;
+  /**
+   * Signer callback invoked immediately before each transaction is submitted.
+   * Receives the transaction XDR string, must return a signed XDR string.
+   * Called serially, once per transaction, in submission order.
+   */
+  sign?: (xdr: string) => Promise<string> | string;
+  /** AbortSignal to cancel an in-progress submission. */
+  signal?: AbortSignal;
+  /**
+   * Optional progress callback invoked each time a transaction reaches a
+   * terminal state (SUCCESS, FAILED, SKIPPED, or ERROR).
+   */
+  onProgress?: (progress: { index: number; method: string; status: BatchTxStatus }) => void;
+}
+
+const DEFAULT_SUBMIT_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_SUBMIT_MAX_POLL_ATTEMPTS = 30;
+
+/**
+ * Submit a built batch sequentially, one transaction at a time.
+ *
+ * Transactions are confirmed before the next one is submitted, because each
+ * carries a pre-assigned sequence number. If any transaction is rejected or
+ * fails, all remaining transactions are marked SKIPPED — they would fail with
+ * `txBAD_SEQ` regardless, since their sequence numbers now have a gap below
+ * them.
+ *
+ * This makes the all-or-nothing nature of a pre-sequenced batch explicit and
+ * observable, rather than a silent failure mode.
+ *
+ * @param transactions  The array returned by {@link buildBatchTransactions} or
+ *                      {@link buildBatchTransactionsSync}.  Every entry must
+ *                      have `prepared: true` (i.e. simulated and assembled).
+ * @param rpcUrl        Soroban RPC endpoint used to submit and poll.
+ * @param options       Optional signer, polling tuning, and abort signal.
+ */
+export async function submitBatch(
+  transactions: BuiltBatchTransaction[],
+  rpcUrl: string,
+  options: BatchSubmitOptions = {},
+): Promise<BatchSubmitResult> {
+  if (!rpcUrl || typeof rpcUrl !== 'string') {
+    throw new BatchBuildError('submitBatch requires a valid rpcUrl');
+  }
+  if (!Array.isArray(transactions)) {
+    throw new BatchBuildError('submitBatch requires an array of BuiltBatchTransaction');
+  }
+
+  const pollIntervalMs  = options.pollIntervalMs  ?? DEFAULT_SUBMIT_POLL_INTERVAL_MS;
+  const maxPollAttempts = options.maxPollAttempts ?? DEFAULT_SUBMIT_MAX_POLL_ATTEMPTS;
+  const server = createRpcServer(rpcUrl);
+
+  const outcomes: BatchTxOutcome[] = [];
+  let firstFailureIndex = -1;
+
+  function pushOutcome(outcome: BatchTxOutcome) {
+    outcomes.push(outcome);
+    if (options.onProgress) {
+      try {
+        options.onProgress({ index: outcome.index, method: outcome.method, status: outcome.status });
+      } catch (handlerErr) {
+        console.warn('[submitBatch] onProgress handler error:', handlerErr);
+      }
+    }
+  }
+
+  for (const built of transactions) {
+    // Once a failure is recorded, mark all subsequent txs as SKIPPED.
+    // Their pre-assigned sequence numbers have a gap below them and would
+    // fail with txBAD_SEQ even if submitted.
+    if (firstFailureIndex !== -1) {
+      pushOutcome({
+        index:  built.index,
+        method: built.method,
+        status: 'SKIPPED',
+        error:  `Skipped because transaction ${firstFailureIndex} failed`,
+      });
+      continue;
+    }
+
+    if (options.signal?.aborted) {
+      pushOutcome({
+        index:  built.index,
+        method: built.method,
+        status: 'SKIPPED',
+        error:  'Aborted',
+      });
+      firstFailureIndex = built.index;
+      continue;
+    }
+
+    // Optionally re-sign the XDR (e.g. hardware wallet, async key service).
+    let xdrToSubmit = built.xdr;
+    if (options.sign) {
+      try {
+        xdrToSubmit = await options.sign(built.xdr);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Sign failed: ${msg}` });
+        firstFailureIndex = built.index;
+        continue;
+      }
+    }
+
+    // Submit.
+    let sent: SorobanRpc.Api.SendTransactionResponse;
+    try {
+      const tx = new Transaction(xdrToSubmit, options.networkPassphrase ?? '');
+      sent = await server.sendTransaction(tx);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Submit failed: ${msg}` });
+      firstFailureIndex = built.index;
+      continue;
+    }
+
+    if (sent.status === 'ERROR') {
+      const msg = sent.errorResult ? JSON.stringify(sent.errorResult) : 'Transaction rejected by network';
+      pushOutcome({ index: built.index, method: built.method, status: 'FAILED', error: msg });
+      firstFailureIndex = built.index;
+      continue;
+    }
+
+    // Poll for confirmation.
+    const hash = sent.hash;
+    let confirmed = false;
+
+    for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+      await new Promise<void>(resolve => setTimeout(resolve, pollIntervalMs));
+
+      if (options.signal?.aborted) {
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: 'Aborted during polling' });
+        firstFailureIndex = built.index;
+        confirmed = true; // Break the poll loop; outer loop will SKIP the rest.
+        break;
+      }
+
+      let status: SorobanRpc.Api.GetTransactionResponse;
+      try {
+        status = await server.getTransaction(hash);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Poll failed: ${msg}` });
+        firstFailureIndex = built.index;
+        confirmed = true;
+        break;
+      }
+
+      if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+        pushOutcome({ index: built.index, method: built.method, status: 'SUCCESS', txHash: hash });
+        confirmed = true;
+        break;
+      }
+
+      if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        pushOutcome({ index: built.index, method: built.method, status: 'FAILED', error: `Transaction failed on-chain: ${hash}` });
+        firstFailureIndex = built.index;
+        confirmed = true;
+        break;
+      }
+      // status === NOT_FOUND: still pending, keep polling
+    }
+
+    if (!confirmed) {
+      // Exhausted poll attempts without a terminal status.
+      pushOutcome({ index: built.index, method: built.method, status: 'ERROR', error: `Transaction timed out after ${maxPollAttempts} poll attempts: ${hash}` });
+      firstFailureIndex = built.index;
+    }
+  }
+
+  return {
+    allSucceeded:      firstFailureIndex === -1,
+    firstFailureIndex,
+    outcomes,
+  };
 }

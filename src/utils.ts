@@ -15,6 +15,9 @@ function pow10(decimals: number): bigint {
 
 /** Convert a display amount string to stroops (bigint) */
 export function toStroops(amount: string, decimals = 7): bigint {
+  if (!/^\d*(\.\d*)?$/.test(amount) || amount === '.' || amount === '') {
+    throw new Error(`Invalid amount format: "${amount}"`);
+  }
   const dotIndex = amount.indexOf('.');
   const whole = dotIndex === -1 ? amount : amount.slice(0, dotIndex);
   const frac = dotIndex === -1 ? '' : amount.slice(dotIndex + 1);
@@ -95,17 +98,30 @@ export function streamProgress(stream: StreamInfo, nowSec = Math.floor(Date.now(
 }
 
 /**
+ * Normalizes a `streamProgress()` result for display/comparison purposes,
+ * mapping the NaN case (open-ended stream that has started) to the
+ * midpoint 0.5. Shared by Module36 and Module48 so their progress deltas
+ * agree at the edges instead of drifting via independent reimplementations.
+ */
+export function normalizeProgress(value: number): number {
+  return Number.isNaN(value) ? 0.5 : value;
+}
+
+/**
  * Current withdrawable balance from a StreamInfo snapshot, without a contract call.
  * Accounts for pause state.
  */
 export function withdrawableLocal(stream: StreamInfo, nowSec = Math.floor(Date.now() / 1000)): bigint {
   if (stream.cancelled) return 0n;
 
-  const effectiveNow = stream.paused
-    ? stream.pausedAt
-    : stream.endTime > 0 && nowSec > stream.endTime
-    ? stream.endTime
-    : nowSec;
+  // Mirror the on-chain `math::streamed_amount` clamp order
+  // (contracts/stream/src/math.rs): clamp to `endTime` first — a stream that
+  // has ended has fully streamed regardless of pause state — then, only while
+  // the stream is still running, freeze accrual at `pausedAt`.
+  const endClamped =
+    stream.endTime > 0 && nowSec > stream.endTime ? stream.endTime : nowSec;
+  const effectiveNow =
+    stream.paused && stream.pausedAt < endClamped ? stream.pausedAt : endClamped;
 
   if (effectiveNow < stream.startTime) return 0n;
 
@@ -171,10 +187,10 @@ export function bigintSafeStringify<T>(value: T): T {
 
 /**
  * Validates whether a string is a well-formed Stellar public key
- * (account address, e.g. 'GABC...XYZ').
+ * (account address, e.g. 'GABC...XYZ') or Soroban contract address ('CABC...XYZ').
  *
  * Performs static format validation only (StrKey encoding, version byte,
- * checksum) -- it does not check whether the account exists on-chain.
+ * checksum) -- it does not check whether the account or contract exists on-chain.
  * Use this to fail fast before submission, e.g. before passing a recipient
  * into client.streams.create().
  */
@@ -182,5 +198,30 @@ export function isValidAddress(address: string): boolean {
   if (typeof address !== 'string' || address.length === 0) {
     return false;
   }
-  return StrKey.isValidEd25519PublicKey(address);
+  return StrKey.isValidEd25519PublicKey(address) || StrKey.isValidContract(address);
+}
+
+/**
+ * A portable `AbortSignal` that aborts after `ms` milliseconds — pass it as
+ * the `signal` option to any SDK method that accepts one, e.g.
+ *
+ *     await client.streams.withdrawable(id, { signal: timeoutSignal(5_000) });
+ *
+ * Uses the native `AbortSignal.timeout()` when the runtime provides it
+ * (Node >= 17.3 / Deno >= 1.20 / Chrome 103 / Firefox 100 / Safari 15.4) and
+ * otherwise falls back to an `AbortController` + `setTimeout`, with `unref()`
+ * on Node so a pending timeout does not keep the process alive.
+ */
+export function timeoutSignal(ms: number): AbortSignal {
+  const AS = AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal };
+  if (typeof AS.timeout === 'function') {
+    return AS.timeout(ms);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+    ms,
+  );
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return controller.signal;
 }
