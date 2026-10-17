@@ -73,11 +73,11 @@ export {
  } from './errors.js';
  export type { ConduitContract, StreamLifecycleState, SorobanDiagnosticInfo } from './errors.js';
 export * from './types/index.js';
-export type { GetStreamInfosOptions, GetStreamInfosResult, GetStreamInfosFailure } from './types/index.js';
+export type { BatchGetStreamsOptions, GetStreamInfosOptions, GetStreamInfosResult, GetStreamInfosFailure } from './types/index.js';
 export * from './adapters/index.js';
 export * from './react/index.js';
 export { FeeEstimator } from './fee-estimator.js';
-export type { FeeEstimatorOptions, FeeEstimateOptions } from './fee-estimator.js';
+export type { FeeEstimatorOptions, FeeEstimateOptions, FeePriority, DynamicFeeOptions } from './fee-estimator.js';
 export { coalesceAsync } from './coalesce-async.js';
 export { WebSocketRelayer } from './relayer/WebSocketRelayer.js';
 export { ErrorMapper, DEFAULT_ERROR_MESSAGE_TYPE_MAP } from './relayer/ErrorMapper.js';
@@ -127,7 +127,7 @@ export {
   getTokenDecimalsCacheMetrics,
   resetTokenDecimalsCacheMetrics,
 } from './soroban.js';
-export { getCircuitState, recordSuccess, recordFailure, resetCircuit, getAllCircuitStates, onCircuitChange, onCircuitStateChange, type CircuitState, type CircuitStatus } from "./rpc-circuit-state.js";
+export { getCircuitState, recordSuccess, recordFailure, resetCircuit, getAllCircuitStates, onCircuitChange, onCircuitStateChange, subscribeCircuitTransitions, type CircuitTransitionListener, type CircuitState, type CircuitStatus } from "./rpc-circuit-state.js";
 
 export {
   formatAddress,

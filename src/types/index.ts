@@ -156,6 +156,13 @@ export interface GetStreamInfosOptions {
   maxConcurrency?: number;
 }
 
+export interface BatchGetStreamsOptions extends GetStreamInfosOptions {
+  /** Number of stream IDs read per chunk. Defaults to 20. */
+  chunkSize?: number;
+  /** Pause in milliseconds between chunks, to stay under RPC rate limits. Defaults to 0. */
+  chunkDelayMs?: number;
+}
+
 export interface GetStreamInfosFailure {
   id:    bigint;
   error: string;

@@ -45,7 +45,7 @@ export type { UseCreateBatchStreamsState, UseCreateBatchStreamsResult, CreateBat
 export { useEstimateStreamFee } from './hooks/useEstimateStreamFee.js';
 export type { UseEstimateStreamFeeResult } from './hooks/useEstimateStreamFee.js';
 export { useWithdrawableAmount } from './hooks/useWithdrawableAmount.js';
-export type { UseWithdrawableAmountResult } from './hooks/useWithdrawableAmount.js';
+export type { UseWithdrawableAmountResult, UseWithdrawableAmountOptions } from './hooks/useWithdrawableAmount.js';
 export { useStreamedTotal } from './hooks/useStreamedTotal.js';
 export type { UseStreamedTotalResult } from './hooks/useStreamedTotal.js';
 export { useFactoryStreamCount } from './hooks/useFactoryStreamCount.js';

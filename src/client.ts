@@ -10,6 +10,8 @@ import type {
   FeeEstimate,
   StreamOperation,
   Network,
+  BatchGetStreamsOptions,
+  GetStreamInfosResult,
 } from "./types/index.js";
 import type { WalletAdapter } from "./adapters/types.js";
 import { DEFAULT_RPC, getServer } from "./soroban.js";
@@ -237,6 +239,42 @@ export class ConduitClient {
     this.streams = new StreamsModule(this.config);
     this.governor = new GovernorModule(this.config);
     this.tokens = new TokenModule(this.config);
+  }
+
+  /**
+   * Read many streams while staying under RPC rate limits.
+   *
+   * Duplicate IDs are collapsed, the remaining IDs are split into chunks of
+   * `chunkSize` (default 20) and chunks are read one after another, each with
+   * bounded concurrency (`maxConcurrency`, default 8). `chunkDelayMs` adds a
+   * pause between chunks. A failing stream is reported in `failures` rather
+   * than failing the whole batch.
+   *
+   * @example
+   * const { results, failures } = await client.getStreamsBatch(ids, { chunkSize: 10 });
+   */
+  async getStreamsBatch(
+    streamIds: (bigint | string)[],
+    options: BatchGetStreamsOptions = {},
+  ): Promise<GetStreamInfosResult> {
+    const chunkSize = Math.max(1, Math.floor(options.chunkSize ?? 20) || 20);
+    const chunkDelayMs = Math.max(0, options.chunkDelayMs ?? 0);
+    const unique = [...new Set(streamIds.map((id) => BigInt(id)))];
+
+    const results: StreamInfo[] = [];
+    const failures: GetStreamInfosResult['failures'] = [];
+    for (let i = 0; i < unique.length; i += chunkSize) {
+      if (i > 0 && chunkDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, chunkDelayMs));
+      }
+      const chunk = await this.streams.getStreamInfos(
+        unique.slice(i, i + chunkSize),
+        options.maxConcurrency === undefined ? {} : { maxConcurrency: options.maxConcurrency },
+      );
+      results.push(...chunk.results);
+      failures.push(...chunk.failures);
+    }
+    return { results, failures };
   }
 
   /**
